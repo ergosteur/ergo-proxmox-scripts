@@ -1,0 +1,3 @@
+# Install as /etc/nut/nut.conf (root:nut, 0640).
+# netserver: run a driver locally and serve it to other machines over the network.
+MODE=netserver

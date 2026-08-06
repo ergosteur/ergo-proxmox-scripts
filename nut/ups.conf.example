@@ -1,0 +1,28 @@
+# Install as /etc/nut/ups.conf (root:nut, 0640).
+#
+# The section name is what clients ask for. Synology DSM only ever requests
+# "ups", so renaming this section will stop DSM from finding the UPS.
+#
+# The values below are an example from a CyberPower CP1500PFCLCDa. Get the ones
+# for your own unit with:
+#
+#     nut-scanner -U -q
+#
+# Do not copy its bus, device or busport lines: those pin the entry to a physical
+# USB port and break on replug. port = "auto" scans the bus instead.
+#
+# vendorid and productid identify the model; product and serial pin the entry to
+# one specific unit. Drop those two if you want the config to survive swapping in
+# a different UPS of the same model.
+
+maxretry = 3
+
+[ups]
+	desc = "CyberPower CP1500PFCLCDa"
+	driver = "usbhid-ups"
+	port = "auto"
+	vendorid = "0764"
+	productid = "0601"
+	product = "CP1500PFCLCDa"
+	serial = "CXXPS0000000"
+	vendor = "CPS"

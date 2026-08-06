@@ -1,0 +1,18 @@
+# Install as /etc/nut/upsd.users (root:nut, 0640).
+#
+# admin: used by this machine's own upsmon, which owns the UPS.
+# Replace CHANGEME, and use the same value in the MONITOR line of upsmon.conf.
+#   openssl rand -base64 18 | tr -d '/+=' | cut -c1-20
+[admin]
+	password = CHANGEME
+	upsmon primary
+	actions = SET
+	instcmds = ALL
+
+# monuser: for Synology DSM, which hardcodes both the username and the password
+# and cannot be configured to use anything else. These are published constants
+# rather than credentials. The secondary role only permits reading status and
+# receiving shutdown notifications, not commanding the UPS.
+[monuser]
+	password = secret
+	upsmon secondary

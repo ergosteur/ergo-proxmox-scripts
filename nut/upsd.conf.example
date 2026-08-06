@@ -1,0 +1,4 @@
+# Install as /etc/nut/upsd.conf (root:nut, 0640).
+# Must be reachable by the Synology. 0.0.0.0 listens on every interface;
+# narrow it to a specific address if the host is multi-homed.
+LISTEN 0.0.0.0 3493
