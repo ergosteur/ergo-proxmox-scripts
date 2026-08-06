@@ -1,9 +1,19 @@
 [Unit]
-Description=IPMI Fan Control silencing
+Description=Temperature-aware IPMI fan control
+Documentation=file:/opt/ergosteur/ipmi-fancontrol-daemon
+# Only needed when conf sets IPMI_INTERFACE=lanplus; harmless for the local
+# "open" interface.
+After=network-online.target
+Wants=network-online.target
+
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/opt/ergosteur/ipmi-fancontrol-manual
-ExecStop=/opt/ergosteur/ipmi-fancontrol-auto
+Type=simple
+ExecStart=/opt/ergosteur/ipmi-fancontrol-daemon
+# The daemon restores the automatic curve on SIGTERM. This is the backstop for
+# the case where it is killed outright and its trap never runs.
+ExecStopPost=/opt/ergosteur/ipmi-fancontrol-auto
+Restart=always
+RestartSec=10
+
 [Install]
 WantedBy=multi-user.target

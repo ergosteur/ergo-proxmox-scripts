@@ -1,0 +1,122 @@
+#!/bin/bash
+# Temperature-aware IPMI fan control for Dell PowerEdge / iDRAC.
+#
+# Holds the fans at a fixed low duty while the CPUs are cool, and hands control
+# back to the BMC's automatic curve once they get hot, so there is still a
+# thermal response under load. This is the native equivalent of the
+# tigerblue77/dell_idrac_fan_controller container, without needing Docker.
+#
+# Run under ipmi-fancontrol.service. Configuration lives in
+# conf/ipmi-fancontrol.conf (see conf/ipmi-fancontrol.conf.example).
+
+set -uo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG=${IPMI_FANCONTROL_CONFIG:-$SCRIPT_DIR/conf/ipmi-fancontrol.conf}
+
+if [[ ! -r "$CONFIG" ]]; then
+    echo "Error: cannot read $CONFIG" >&2
+    echo "Copy conf/ipmi-fancontrol.conf.example there and fill it in." >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+. "$CONFIG"
+
+: "${IPMI_INTERFACE:=open}"
+: "${FAN_SPEED:=0x15}"
+: "${CPU_TEMP_THRESHOLD:=70}"
+: "${CPU_TEMP_HYSTERESIS:=5}"
+: "${CHECK_INTERVAL:=60}"
+: "${DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE:=false}"
+
+RESUME_AT=$((CPU_TEMP_THRESHOLD - CPU_TEMP_HYSTERESIS))
+
+# Build the ipmitool invocation once. The local "open" interface needs no
+# credentials and no network, so it is the better choice for a polling loop;
+# lanplus stays available for reaching a BMC over the network.
+if [[ "$IPMI_INTERFACE" == "lanplus" ]]; then
+    : "${IPMI_HOST:?not set in $CONFIG}"
+    : "${IPMI_USER:?not set in $CONFIG}"
+    : "${IPMI_PASSWORD:?not set in $CONFIG}"
+    export IPMI_PASSWORD
+    IPMITOOL=(ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -E)
+else
+    IPMITOOL=(ipmitool -I open)
+fi
+
+# stdout goes to the journal under systemd.
+log() { echo "$*"; }
+
+set_manual() {
+    "${IPMITOOL[@]}" raw 0x30 0x30 0x01 0x00 >/dev/null &&
+        "${IPMITOOL[@]}" raw 0x30 0x30 0x02 0xff "$FAN_SPEED" >/dev/null
+}
+
+set_auto() {
+    "${IPMITOOL[@]}" raw 0x30 0x30 0x01 0x01 >/dev/null
+}
+
+# Highest CPU temperature in degrees C, or empty if none could be read.
+# CPU sensors are entity 3.x; 7.x is the system board (inlet/exhaust).
+max_cpu_temp() {
+    "${IPMITOOL[@]}" sdr type temperature 2>/dev/null | awk -F'|' '
+        $4 ~ /^[[:space:]]*3\./ {
+            if (match($5, /-?[0-9]+/)) {
+                t = substr($5, RSTART, RLENGTH) + 0
+                if (!seen || t > max) max = t
+                seen = 1
+            }
+        }
+        END { if (seen) print max }
+    '
+}
+
+MODE=""
+
+cleanup() {
+    log "Stopping: returning fan control to the BMC automatic curve."
+    set_auto || log "Warning: failed to restore automatic fan control."
+    exit 0
+}
+trap cleanup TERM INT
+
+if [[ "$DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE" == "true" ]]; then
+    if "${IPMITOOL[@]}" raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 0x01 0x00 0x00 >/dev/null 2>&1; then
+        log "Disabled the third-party PCIe card default cooling response."
+    else
+        log "Warning: could not disable the third-party PCIe cooling response."
+    fi
+fi
+
+log "Starting: fans held at $FAN_SPEED below ${CPU_TEMP_THRESHOLD}C, automatic at or above it, re-engaging at ${RESUME_AT}C. Polling every ${CHECK_INTERVAL}s over $IPMI_INTERFACE."
+
+while true; do
+    temp=$(max_cpu_temp)
+
+    if [[ -z "$temp" ]]; then
+        # Fail safe: if the temperature cannot be read, let the BMC cool the box.
+        if [[ "$MODE" != "auto" ]]; then
+            log "Cannot read CPU temperature; failing safe to automatic fan control."
+            set_auto && MODE="auto"
+        fi
+    elif (( temp >= CPU_TEMP_THRESHOLD )); then
+        if [[ "$MODE" != "auto" ]]; then
+            log "CPU at ${temp}C, at or above ${CPU_TEMP_THRESHOLD}C: handing control to the BMC automatic curve."
+            set_auto && MODE="auto"
+        fi
+    elif [[ -z "$MODE" ]] || (( temp <= RESUME_AT )); then
+        # The -z test makes the very first pass decide rather than drift, even
+        # if we start up inside the hysteresis band.
+        if [[ "$MODE" != "manual" ]]; then
+            log "CPU at ${temp}C, at or below ${RESUME_AT}C: holding fans at $FAN_SPEED."
+            set_manual && MODE="manual"
+        fi
+    fi
+    # Inside the hysteresis band we deliberately keep whatever mode we are in.
+
+    # Backgrounded so that SIGTERM interrupts the wait instead of being deferred
+    # until the sleep finishes.
+    sleep "$CHECK_INTERVAL" &
+    wait $!
+done

@@ -1,4 +1,4 @@
-# Credentials for the BMC user driving ipmi-fancontrol-manual / ipmi-fancontrol-auto.
+# Configuration for the ipmi-fancontrol scripts and daemon.
 #
 # Copy to conf/ipmi-fancontrol.conf next to the scripts and lock it down:
 #   cp conf/ipmi-fancontrol.conf.example conf/ipmi-fancontrol.conf
@@ -7,11 +7,34 @@
 # The scripts look for it relative to their own location, so this works both in a
 # checkout and deployed at /opt/ergosteur. Override with IPMI_FANCONTROL_CONFIG.
 
+# How to reach the BMC.
+#   open    - local /dev/ipmi0, needs no credentials or network (recommended
+#             on the host itself; requires the ipmi_si and ipmi_devintf modules)
+#   lanplus - over the network, using the host/user/password below
+IPMI_INTERFACE=open
+
+# Only used when IPMI_INTERFACE=lanplus.
 IPMI_HOST=169.254.0.1
 IPMI_USER=fancontrol
-
 # Read by ipmitool -E, so it never appears in the process table.
 IPMI_PASSWORD=changeme
 
-# Fan speed applied in manual mode, as a raw hex byte (0x15 = 21%).
+# Fan duty held while the CPUs are cool, as a raw hex byte (0x15 = 21%).
 FAN_SPEED=0x15
+
+# --- Daemon settings (ipmi-fancontrol-daemon only) ---
+
+# At or above this CPU temperature in degrees C, hand control back to the BMC's
+# automatic curve so the fans can actually ramp.
+CPU_TEMP_THRESHOLD=70
+
+# Cool back down to (CPU_TEMP_THRESHOLD - CPU_TEMP_HYSTERESIS) before the fixed
+# speed is re-engaged. Stops the fans oscillating around the threshold.
+CPU_TEMP_HYSTERESIS=5
+
+# Seconds between temperature checks.
+CHECK_INTERVAL=60
+
+# Dell raises the fan floor whenever it sees a third-party PCIe card. Set true to
+# suppress that, which is usually what you want with aftermarket NICs or HBAs.
+DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE=false

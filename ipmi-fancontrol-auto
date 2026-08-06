@@ -1,6 +1,7 @@
 #!/bin/sh
 # Hand fan control back to the BMC's automatic curve.
-# Paired with ipmi-fancontrol-manual via ipmi-fancontrol.service.
+#
+# Used ad-hoc, and as the ExecStopPost backstop for ipmi-fancontrol.service.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -8,18 +9,31 @@ CONFIG=${IPMI_FANCONTROL_CONFIG:-$SCRIPT_DIR/conf/ipmi-fancontrol.conf}
 
 if [ ! -r "$CONFIG" ]; then
     echo "Error: cannot read $CONFIG" >&2
-    echo "Copy conf/ipmi-fancontrol.conf.example there and fill in the BMC credentials." >&2
+    echo "Copy conf/ipmi-fancontrol.conf.example there and fill it in." >&2
     exit 1
 fi
 
 . "$CONFIG"
 
-: "${IPMI_HOST:?not set in $CONFIG}"
-: "${IPMI_USER:?not set in $CONFIG}"
-: "${IPMI_PASSWORD:?not set in $CONFIG}"
+: "${IPMI_INTERFACE:=open}"
 
-# ipmitool -E reads the password from IPMI_PASSWORD, keeping it out of argv.
-export IPMI_PASSWORD
+# The local "open" interface needs no credentials and no network, which matters
+# here: this runs at shutdown, when networking may already be gone.
+ipmi() {
+    if [ "$IPMI_INTERFACE" = "lanplus" ]; then
+        ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -E "$@"
+    else
+        ipmitool -I open "$@"
+    fi
+}
+
+if [ "$IPMI_INTERFACE" = "lanplus" ]; then
+    : "${IPMI_HOST:?not set in $CONFIG}"
+    : "${IPMI_USER:?not set in $CONFIG}"
+    : "${IPMI_PASSWORD:?not set in $CONFIG}"
+    # ipmitool -E reads the password from the environment, keeping it out of argv.
+    export IPMI_PASSWORD
+fi
 
 # Re-enable automatic fan control.
-ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -E raw 0x30 0x30 0x01 0x01
+ipmi raw 0x30 0x30 0x01 0x01
