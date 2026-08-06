@@ -1,4 +1,16 @@
 #!/bin/bash
+#
+# RETIRED. Kept for reference only.
+#
+# Proxmox imports OVA/OVF natively now, via a storage with the "import" content
+# type: upload the .ova there and use Create VM > Import, or `qm importovf`.
+# The built-in path handles disk format conversion per storage type, which this
+# script did not.
+#
+# Known bug, left unfixed since the script is retired: importdisk is called with
+# --format qcow2 unconditionally, which fails on ZFS and LVM-thin storages that
+# do not take a format argument.
+
 set -euo pipefail
 
 # === OVF/OVA Importer for Proxmox ===

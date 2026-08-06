@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+#
+# RETIRED. Kept for reference only.
+#
+# Proxmox imports OVA/OVF natively now, via a storage with the "import" content
+# type: upload the .ova there and use Create VM > Import, or `qm importovf`.
+# The built-in path handles disk format conversion per storage type, which this
+# script did not.
+#
+# Two known bugs, left unfixed since the script is retired:
+#   * every VMDK is imported in the loop, but only vm-<vmid>-disk-0 is ever
+#     attached, so multi-disk appliances leave the rest orphaned
+#   * the disk name is assumed to be vm-<vmid>-disk-N, which does not hold on
+#     every storage type
 
 import os
 import sys
