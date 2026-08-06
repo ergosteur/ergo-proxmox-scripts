@@ -13,3 +13,7 @@ tmp/
 *.iso
 *.ova
 *.vmdk
+
+# Python bytecode
+__pycache__/
+*.pyc
