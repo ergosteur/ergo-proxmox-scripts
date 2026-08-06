@@ -1,0 +1,16 @@
+[Unit]
+Description=NIC performance tuning for enp4s0f0np0, enp4s1f12np12 and vmbr0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -G enp4s1f12np12 rx 4096 tx 4096
+ExecStart=/sbin/ip link set enp4s1f12np12 txqueuelen 10000
+ExecStart=/usr/sbin/ethtool -G enp4s0f0np0 rx 4096 tx 4096
+ExecStart=/sbin/ip link set enp4s0f0np0 txqueuelen 10000
+ExecStart=/sbin/ip link set vmbr0 txqueuelen 10000
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

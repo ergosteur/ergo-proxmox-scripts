@@ -1,0 +1,9 @@
+[Unit]
+Description=Script to enable SR-IOV on boot for enp130s0
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c '/usr/bin/echo 4 > /sys/class/net/enp130s0f0/device/sriov_numvfs'
+ExecStart=/usr/bin/bash -c '/usr/bin/echo 4 > /sys/class/net/enp130s0f1/device/sriov_numvfs'
+ExecStart=/opt/ergosteur/set-ixgbe-vfmacs-enp130s0.sh 
+[Install]
+WantedBy=multi-user.target
