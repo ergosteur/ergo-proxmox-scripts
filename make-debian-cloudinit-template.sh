@@ -1,23 +1,27 @@
 #!/bin/bash
-# Build a Proxmox cloud-init template VM from a cloud image URL.
+# Build a Proxmox cloud-init template VM from a Debian cloud image.
 #
 # Usage:
-#   ./make-debian-cloudinit-template.sh <VMID> [IMAGE_URL]
+#   ./make-debian-cloudinit-template.sh <VMID> [CODENAME]
+#
+# CODENAME is a Debian release codename (default: trixie). Known:
+#   bullseye (11), bookworm (12), trixie (13), forky (14)
 #
 # Optional overrides (env vars):
+#   IMAGE_URL Full image URL, overrides CODENAME lookup entirely
 #   STORAGE   Proxmox storage pool for disks   (default: local-zfs)
 #   BRIDGE    Network bridge                   (default: vmbr0)
 #   MEMORY    RAM in MB                        (default: 2048)
 #   CORES     CPU cores                        (default: 4)
-#   NAME      Template name in Proxmox         (default: debian-cloudinit-<VMID>)
+#   NAME      Template name in Proxmox         (default: debian-<CODENAME>-cloudinit-<VMID>)
 #
 # Example:
-#   STORAGE=local-lvm BRIDGE=vmbr1 ./make-debian-cloudinit-template.sh 9000
+#   STORAGE=local-lvm BRIDGE=vmbr1 ./make-debian-cloudinit-template.sh 9000 bookworm
 
 set -euo pipefail
 
 usage() {
-    grep '^#' "$0" | sed -e 's/^#//' -e 's/^ //' | head -n 12
+    grep '^#' "$0" | sed -e 's/^#//' -e 's/^ //' | head -n 20
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -49,12 +53,30 @@ if qm status "$ID" &>/dev/null; then
     exit 1
 fi
 
-URL=${2:-"https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"}
+declare -A DEBIAN_VERSIONS=(
+    [bullseye]=11
+    [bookworm]=12
+    [trixie]=13
+    [forky]=14
+)
+
+CODENAME=${2:-trixie}
 STORAGE=${STORAGE:-local-zfs}
 BRIDGE=${BRIDGE:-vmbr0}
 MEMORY=${MEMORY:-2048}
 CORES=${CORES:-4}
-NAME=${NAME:-"debian-cloudinit-$ID"}
+NAME=${NAME:-"debian-$CODENAME-cloudinit-$ID"}
+
+if [[ -n "${IMAGE_URL:-}" ]]; then
+    URL="$IMAGE_URL"
+else
+    VERSION=${DEBIAN_VERSIONS[$CODENAME]:-}
+    if [[ -z "$VERSION" ]]; then
+        echo "Error: unknown Debian codename '$CODENAME'. Known: ${!DEBIAN_VERSIONS[*]}" >&2
+        exit 1
+    fi
+    URL="https://cloud.debian.org/images/cloud/$CODENAME/latest/debian-$VERSION-genericcloud-amd64.qcow2"
+fi
 
 if ! pvesm status -storage "$STORAGE" &>/dev/null; then
     echo "Error: storage pool '$STORAGE' not found (check STORAGE env var)." >&2
