@@ -1,0 +1,11 @@
+# Alert destination for vm-watchdog.sh and lxc-watchdog.sh.
+#
+# Copy to conf/watchdog.conf next to the scripts:
+#   cp conf/watchdog.conf.example conf/watchdog.conf
+#
+# The scripts look for it relative to their own location, so this works both in a
+# checkout and deployed at /opt/ergosteur. Override with WATCHDOG_CONFIG.
+#
+# If the file is absent the watchdogs still run and log; they just skip the email.
+
+WATCHDOG_EMAIL=alerts@example.com

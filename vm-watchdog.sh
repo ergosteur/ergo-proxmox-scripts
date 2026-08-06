@@ -11,7 +11,17 @@ declare -A VMs=(
 )
 
 logFile="/var/log/proxmox_watchdog.log"
-email="alerts@example.com"
+
+# Alert address comes from conf/watchdog.conf (see conf/watchdog.conf.example),
+# resolved relative to this script so it works from a checkout or /opt/ergosteur.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG=${WATCHDOG_CONFIG:-$SCRIPT_DIR/conf/watchdog.conf}
+email=""
+if [[ -r "$CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    . "$CONFIG"
+    email="${WATCHDOG_EMAIL:-}"
+fi
 
 # Log function
 log () {
@@ -24,6 +34,10 @@ log () {
 sendAlert () {
     subject="[Proxmox WatchDog] $1"
     body="$2"
+    if [[ -z "$email" ]]; then
+        log "No WATCHDOG_EMAIL configured in $CONFIG; skipping alert: $subject"
+        return
+    fi
     echo -e "$body" | mail -s "$subject" "$email"
 }
 
