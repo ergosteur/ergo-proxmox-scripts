@@ -1,0 +1,17 @@
+# Credentials for pa-vm_api_stop.sh (PAN-OS XML API shutdown).
+#
+# Copy to conf/pa-vm.conf next to the scripts and lock it down:
+#   cp conf/pa-vm.conf.example conf/pa-vm.conf
+#   chmod 0600 conf/pa-vm.conf
+#
+# The script looks for it relative to its own location, so this works both in a
+# checkout and deployed at /opt/ergosteur. Override with PA_VM_CONFIG.
+#
+# Generate a key with:
+#   curl -k -X POST 'https://<host>/api/?type=keygen' \
+#        --data-urlencode 'user=<user>' --data-urlencode 'password=<password>'
+
+PA_VM_HOST=pa-vm
+
+# Passed as an X-PAN-KEY header via curl --config, so it stays out of argv.
+PA_VM_API_KEY=changeme

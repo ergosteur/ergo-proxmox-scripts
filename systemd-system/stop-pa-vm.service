@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop PA-VM via XML API
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStop=/opt/ergosteur/pa-vm_api_stop.sh
+
+[Install]
+WantedBy=multi-user.target
