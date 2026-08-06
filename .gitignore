@@ -1,0 +1,15 @@
+# Local secrets — never commit.
+# Scripts read these at runtime; the committed *.conf.example files are the templates.
+*.conf
+!*.conf.example
+.env
+!.env.example
+
+# Host dumps and scratch output
+bridge-vlan-show.txt
+tmp/
+*.qcow2
+*.img
+*.iso
+*.ova
+*.vmdk
