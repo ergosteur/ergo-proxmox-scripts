@@ -1,0 +1,9 @@
+[Unit]
+Description=IPMI Fan Control silencing
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ergosteur/ipmi-fancontrol-manual
+ExecStop=/opt/ergosteur/ipmi-fancontrol-auto
+[Install]
+WantedBy=multi-user.target
