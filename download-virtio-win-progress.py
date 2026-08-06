@@ -36,7 +36,8 @@ for link in soup.find_all('a', href=True):
         break
 
 if latest_iso_link and version_number:
-    print(f"Version Number: {version_number}")
+    if not args.cron:
+        print(f"Version Number: {version_number}")
 
     # Construct the download URL
     iso_url = url + latest_iso_link['href']
