@@ -1,0 +1,10 @@
+# Fetch the latest virtio-win ISO nightly. Install to /etc/cron.d/download-virtio-win.
+#
+# /etc/cron.d entries take a user field between the schedule and the command,
+# which the previous version omitted, so cron parsed the script path as the
+# username. Its day-of-month field was also 0, which is out of range (1-31).
+# Between them the job never ran.
+#
+# --cron suppresses the progress bar so a no-op run produces no cron mail.
+
+0 0 * * * root /opt/ergosteur/download-virtio-win-progress.py --cron --dir /var/lib/vz/template/iso/
