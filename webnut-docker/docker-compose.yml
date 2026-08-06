@@ -1,0 +1,20 @@
+services:
+  webnut:
+    image: teknologist/webnut
+    container_name: webnut
+    # Values come from .env alongside this file (see .env.example).
+    environment:
+      - UPS_HOST=${UPS_HOST:?set UPS_HOST in .env}
+      - UPS_PORT=${UPS_PORT:-3493}
+      - UPS_USER=${UPS_USER:?set UPS_USER in .env}
+      - UPS_PASSWORD=${UPS_PASSWORD:?set UPS_PASSWORD in .env}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - webnut-net
+    ports:
+      - 6543:6543
+networks:
+  webnut-net:
+    external: true
