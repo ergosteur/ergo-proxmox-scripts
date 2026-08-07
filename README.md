@@ -3,8 +3,8 @@
 Host-side tooling for a Proxmox VE node: cloud-init template building, IPMI fan
 control, UPS/NUT setup, and a few odds and ends.
 
-This repository mirrors `/opt/ergosteur` on the Proxmox host. Nothing here is
-live until it is copied across — see [Deploying](#deploying).
+`/opt/ergosteur` on the Proxmox host is a checkout of this repository. Nothing
+here is live until the host pulls — see [Deploying](#deploying).
 
 ## Cloud-init templates
 
@@ -150,16 +150,28 @@ repository.
 
 ## Deploying
 
-`/opt/ergosteur` on the host is a plain directory, not a git checkout, so
-changes have to be copied over and will not appear from a `git pull`:
+`/opt/ergosteur` is a checkout of this repository, so deploying is a pull:
 
 ```sh
-scp build-cloudinit-template.sh update-image-pins.sh root@pet630:/opt/ergosteur/
+ssh root@pet630 'git -C /opt/ergosteur pull'
 ```
 
-Unit files under `systemd-system/` are mirrored to `/opt/ergosteur` for
-reference, but systemd reads them from `/etc/systemd/system`. Changing one
-means updating both and running `systemctl daemon-reload`.
+The remote is the HTTPS URL, not SSH. The repository is public, so the host
+needs no credentials and no deploy key; the trade-off is that it cannot push,
+which is what you want of a deploy target. Commit here, pull there.
+
+Local configuration under `conf/` is gitignored and survives a pull untouched.
+
+Two things to keep in mind:
+
+Unit files under `systemd-system/` are in the checkout, but systemd reads them
+from `/etc/systemd/system`. Changing one means copying it across and running
+`systemctl daemon-reload`; a pull alone changes nothing.
+
+The executable bit is carried by git, so a script committed without it will be
+non-executable on the host and any unit with it as `ExecStart` will fail to
+start. `git update-index --chmod=+x <file>` fixes a file already committed
+without it.
 
 ## Conventions
 
