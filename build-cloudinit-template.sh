@@ -34,6 +34,9 @@ fi
 # --- Distribution version pins (update these over time) ---
 ALPINE_MAJOR="v3.24"
 ALPINE_PATCH="3.24.1"
+# Upstream renamed the cloud image prefix from nocloud_ to generic_ in 3.24, so
+# this tracks the branch: generic_ for 3.24+, nocloud_ for 3.23 and older.
+ALPINE_PREFIX="generic"
 UBUNTU_CODENAME="resolute"   # 26.04 LTS
 UBUNTU_VER="2604"
 DEBIAN_CODENAME="trixie"
@@ -121,9 +124,7 @@ fi
 case $DISTRO_CHOICE in
     alpine)
         VM_NAME="alpine-${ALPINE_MAJOR//v/}-cloudinit"
-        # Upstream renamed the cloud image prefix from nocloud_ to generic_ in 3.24;
-        # 3.23 and older only have nocloud_, so this URL is not backward-compatible.
-        IMAGE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_MAJOR}/releases/cloud/generic_alpine-${ALPINE_PATCH}-x86_64-uefi-cloudinit-r0.qcow2"
+        IMAGE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_MAJOR}/releases/cloud/${ALPINE_PREFIX}_alpine-${ALPINE_PATCH}-x86_64-uefi-cloudinit-r0.qcow2"
         DEFAULT_DISK_SIZE="8G"
         PKG_MGR="apk"
         ;;
