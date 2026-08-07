@@ -17,12 +17,24 @@ sudo ./build-cloudinit-template.sh <VMID> <alpine|ubuntu|debian|fedora|almalinux
 
 It downloads the cloud image (cached under `/var/tmp/pve-cloudinit-images`),
 imports it, generates a cloud-init vendor snippet that installs the QEMU guest
-agent and optionally Docker, then converts the VM to a template. Storage,
-bridge, memory, cores, disk size, SSH keys and the cloud-init password are all
-overridable by environment variable; run with `--help` for the full list.
+agent, then converts the VM to a template. Storage, bridge, memory, cores, disk
+size, SSH keys and the cloud-init password are all overridable by environment
+variable; run with `--help` for the full list.
 
 The snippet storage must have the **Snippets** content type enabled, which is
 off by default. The script checks this up front rather than failing later.
+
+`--docker`, which must be the third argument, adds a Docker install to the
+snippet, suffixes the template name with `-docker` and tags it `docker`. Alpine
+and Arch use their own packages; the others use the convenience script from
+`get.docker.com`, so they get Docker CE rather than the distro build. The
+cloud-init user is added to the `docker` group, which is root-equivalent on
+that guest.
+
+Note that the install happens on first boot of each *clone*, not during the
+build — the snippet is a `runcmd` and the template itself is never booted. Each
+clone therefore fetches Docker itself and reboots once. Nothing is baked into
+the template image.
 
 ### Version pins
 

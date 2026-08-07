@@ -4,6 +4,16 @@
 # Usage:
 #   ./build-cloudinit-template.sh <VMID> <alpine|ubuntu|debian|fedora|almalinux|arch> [--docker]
 #
+# --docker adds a Docker install to the cloud-init snippet, names the template
+# with a -docker suffix and tags it "docker". Alpine and Arch use their own
+# packages; the rest use Docker's convenience script from get.docker.com, so
+# they get Docker CE rather than the distro build. The cloud-init user is added
+# to the docker group, which is root-equivalent on that guest.
+#
+# The install runs on first boot of each clone, not while building: the snippet
+# is a runcmd and the template is never booted. So every clone fetches Docker
+# itself, and the template stays generic. It must be the third argument.
+#
 # Optional overrides (env vars):
 #   STORAGE          Proxmox storage pool for disks   (default: local-btrfs)
 #   SNIPPET_STORAGE  Storage holding cloud-init snippets, must have the
