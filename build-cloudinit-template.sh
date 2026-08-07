@@ -32,15 +32,15 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 # --- Distribution version pins (update these over time) ---
-ALPINE_MAJOR="v3.23"
-ALPINE_PATCH="3.23.3"
-UBUNTU_CODENAME="noble"
-UBUNTU_VER="2404"
+ALPINE_MAJOR="v3.24"
+ALPINE_PATCH="3.24.1"
+UBUNTU_CODENAME="resolute"   # 26.04 LTS
+UBUNTU_VER="2604"
 DEBIAN_CODENAME="trixie"
 DEBIAN_VER="13"
-FEDORA_VER="41"
-FEDORA_RELEASE="1.4"   # minor release can change throughout the cycle
-ALMA_VER="9"
+FEDORA_VER="44"
+FEDORA_RELEASE="1.7"   # minor release can change throughout the cycle
+ALMA_VER="10"
 # Arch is rolling, so it pulls the "latest" build natively.
 
 # --- Overridable configuration ---
@@ -121,7 +121,9 @@ fi
 case $DISTRO_CHOICE in
     alpine)
         VM_NAME="alpine-${ALPINE_MAJOR//v/}-cloudinit"
-        IMAGE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_MAJOR}/releases/cloud/nocloud_alpine-${ALPINE_PATCH}-x86_64-uefi-cloudinit-r0.qcow2"
+        # Upstream renamed the cloud image prefix from nocloud_ to generic_ in 3.24;
+        # 3.23 and older only have nocloud_, so this URL is not backward-compatible.
+        IMAGE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_MAJOR}/releases/cloud/generic_alpine-${ALPINE_PATCH}-x86_64-uefi-cloudinit-r0.qcow2"
         DEFAULT_DISK_SIZE="8G"
         PKG_MGR="apk"
         ;;
