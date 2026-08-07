@@ -34,6 +34,9 @@ TARGET="$SCRIPT_DIR/build-cloudinit-template.sh"
 WRITE=false
 ONLY=()
 
+# Arch is absent deliberately: it is rolling and has no pin to check.
+DISTROS=(alpine ubuntu debian fedora almalinux)
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
@@ -48,6 +51,15 @@ done
 
 for bin in curl sed grep sort; do
     command -v "$bin" >/dev/null || { echo "Required command '$bin' not found." >&2; exit 1; }
+done
+
+# Reject a misspelled --distro rather than filtering everything out and
+# reporting "all pins are current", which reads as success.
+for d in ${ONLY[@]+"${ONLY[@]}"}; do
+    [[ " ${DISTROS[*]} " == *" $d "* ]] && continue
+    echo "Error: unknown distro '$d'." >&2
+    echo "Choose one of: ${DISTROS[*]}  (arch is rolling and has no pin)" >&2
+    exit 1
 done
 
 [[ -f "$TARGET" ]] || { echo "Error: template script not found at $TARGET" >&2; exit 1; }
@@ -87,6 +99,7 @@ current_pin() {
 image_urls_from() {
     local script=$1 pins cases out
     pins=$(sed -n '/^# --- Distribution version pins/,/^# Arch is rolling/p' "$script")
+    # shellcheck disable=SC2016  # a literal $DISTRO_CHOICE in the sed address
     cases=$(sed -n '/^case \$DISTRO_CHOICE in$/,/^esac$/p' "$script")
     # Both anchors must have matched something recognisable. Without this an
     # unmatched anchor yields an empty fragment that still runs, producing URLs
@@ -101,7 +114,10 @@ image_urls_from() {
             printf '%s\n' "$pins"
             echo 'for DISTRO_CHOICE in alpine ubuntu debian fedora almalinux arch; do'
             printf '%s\n' "$cases"
-            echo 'printf "%s %s\n" "$DISTRO_CHOICE" "$IMAGE_URL"; done'
+            # printf, not echo: the \n belongs to the emitted fragment, and
+            # echo's handling of backslashes is implementation-defined.
+            # shellcheck disable=SC2016  # emitting code, expansion happens there
+            printf '%s\n' 'printf "%s %s\n" "$DISTRO_CHOICE" "$IMAGE_URL"; done'
         } | bash 2>/dev/null
     ) || true
     # Six distros in, six URLs out; anything less means the template no longer
@@ -189,9 +205,21 @@ discover_alpine() {
     printf 'ALPINE_MAJOR=v%s\nALPINE_PATCH=%s\nALPINE_PREFIX=%s\n' "${patch%.*}" "$patch" "$prefix"
 }
 
+# Dispatch explicitly rather than calling "discover_$distro". The indirect form
+# reads as dead code to both shellcheck and to anyone grepping for a caller.
+discover() {
+    case $1 in
+        alpine)    discover_alpine ;;
+        ubuntu)    discover_ubuntu ;;
+        debian)    discover_debian ;;
+        fedora)    discover_fedora ;;
+        almalinux) discover_almalinux ;;
+        *)         return 1 ;;
+    esac
+}
+
 # --- Collect proposals ------------------------------------------------------
 
-DISTROS=(alpine ubuntu debian fedora almalinux)
 declare -A PROPOSED=()
 CHANGED=()
 FAILED=()
@@ -199,7 +227,7 @@ FAILED=()
 echo "Checking upstream for current stable releases..."
 for distro in "${DISTROS[@]}"; do
     wanted "$distro" || continue
-    if ! result=$("discover_$distro"); then
+    if ! result=$(discover "$distro"); then
         echo "  $distro: lookup FAILED" >&2
         FAILED+=("$distro")
         continue
