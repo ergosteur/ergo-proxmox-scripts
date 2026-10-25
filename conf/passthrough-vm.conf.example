@@ -1,0 +1,32 @@
+# VM and devices for start-passthrough-vm.sh.
+#
+# Copy to conf/passthrough-vm.conf next to the scripts:
+#   cp conf/passthrough-vm.conf.example conf/passthrough-vm.conf
+#
+# The script looks for it relative to its own location, so this works both in a
+# checkout and deployed at /opt/ergosteur. Override with PASSTHROUGH_VM_CONFIG.
+#
+# Give the VM onboot: 0 so that Proxmox's own autostart leaves it alone, and
+# point its hostpci entries at resource mappings rather than PCI addresses:
+#   qm set <vmid> --onboot 0
+#   qm set <vmid> --hostpci0 mapping=<mapping-id>,pcie=1
+
+VMID=100
+
+# One entry per resource mapping the VM uses: "<mapping-id> <lookup> <args>".
+#
+#   by-id <vendor:device:subvendor:subdevice>
+#       Exactly one device in the host must have these IDs, and it must already
+#       be on vfio-pci (or have no driver). Read them from sysfs:
+#       cat /sys/bus/pci/devices/<addr>/{vendor,device,subsystem_vendor,subsystem_device}
+#
+#   by-netdev <interface> <mac> <vendor:device:subvendor:subdevice>
+#       For one port of a multi-port NIC, where every port has the same IDs:
+#       the device behind <interface>, which must be pinned to <mac> by a .link
+#       file in /etc/systemd/network so that its name survives renumbering. Note
+#       that the ports of one card need not share a subsystem ID; read it from
+#       the port itself.
+DEVICES=(
+    "hba      by-id      1000:0097:1000:3090"
+    "nic-port by-netdev  nic0p1 00:11:22:33:44:55 8086:1572:8086:0000"
+)

@@ -1,0 +1,16 @@
+[Unit]
+Description=Start the guests that depend on the passthrough VM
+# If passthrough-vm-start.service fails this does not run, so nothing that needs
+# the VM is started without it.
+Requires=passthrough-vm-start.service
+After=passthrough-vm-start.service pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/opt/ergosteur/start-dependents.sh
+# Covers WAIT_SECS in conf/dependents.conf plus the starts themselves.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

@@ -143,6 +143,8 @@ repository.
 | `nut/` | Reference `/etc/nut` configuration for hand-configuring a host. |
 | `pa-vm_api_stop.sh` | Graceful PA-VM firewall shutdown over the PAN-OS XML API, as `ExecStop`. |
 | `prox-maintenance-mode.sh` | Disables `onboot` autostart on every VM and container before host maintenance and restores it afterwards, saving the previous state to `/var/tmp`. `--enable`/`--disable`/`--status`, plus `--dry-run`. |
+| `start-passthrough-vm.sh` | Starts a VM with PCIe passthrough at boot only once each device has been found by ID or by its MAC-pinned interface rather than by PCI address, repointing its resource mapping if a new card has renumbered the buses. Run by `passthrough-vm-start.service`; configured in `conf/passthrough-vm.conf`. `--check` to verify without starting. |
+| `start-dependents.sh` | Starts the guests that need that VM, in order, once a port on it answers. Run by `dependents-start.service`; configured in `conf/dependents.conf`. Both scripts stand down while `prox-maintenance-mode.sh` has autostart disabled. |
 | `download-virtio-win-progress.py` | Fetches the virtio-win driver ISO. |
 | `systemd-system/` | Unit files, installed to `/etc/systemd/system`. |
 | `conf/` | Configuration, kept beside the scripts rather than in `/etc`. Committed as `.example`; the real files are not in git. |

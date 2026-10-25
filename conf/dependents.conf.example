@@ -1,0 +1,24 @@
+# Guests for start-dependents.sh, started once the passthrough VM is serving.
+#
+# Copy to conf/dependents.conf next to the scripts:
+#   cp conf/dependents.conf.example conf/dependents.conf
+#
+# The script looks for it relative to its own location, so this works both in a
+# checkout and deployed at /opt/ergosteur. Override with DEPENDENTS_CONFIG.
+#
+# Give every guest listed here onboot: 0, so that Proxmox does not start it
+# ahead of the VM it needs:
+#   qm set <vmid> --onboot 0
+#   pct set <ctid> --onboot 0
+
+# Started in this order. VM and container IDs both work.
+GUESTS=(
+    101
+    102
+)
+
+# Wait for this host:port to accept connections before starting them, for up to
+# WAIT_SECS seconds; an SMB or NFS port on the NAS, for example. Leave WAIT_FOR
+# empty to start them straight away.
+WAIT_FOR=192.0.2.10:445
+WAIT_SECS=300

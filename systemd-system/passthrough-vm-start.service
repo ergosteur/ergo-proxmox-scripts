@@ -1,0 +1,13 @@
+[Unit]
+Description=Start the passthrough VM after checking its PCIe devices
+After=pve-guests.service pve-cluster.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/opt/ergosteur/start-passthrough-vm.sh
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
