@@ -2,6 +2,9 @@
 # Hand fan control back to the BMC's automatic curve.
 #
 # Used ad-hoc, and as the ExecStopPost backstop for ipmi-fancontrol.service.
+# When the config has DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE=true it also
+# puts Dell's third-party PCIe cooling response back, since the daemon turns it
+# off at startup and that setting persists in the BMC.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -16,6 +19,7 @@ fi
 . "$CONFIG"
 
 : "${IPMI_INTERFACE:=open}"
+: "${DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE:=false}"
 
 # The local "open" interface needs no credentials and no network, which matters
 # here: this runs at shutdown, when networking may already be gone.
@@ -37,3 +41,11 @@ fi
 
 # Re-enable automatic fan control.
 ipmi raw 0x30 0x30 0x01 0x01
+
+# Re-enable Dell's third-party PCIe card cooling response (last data byte 0x00).
+# Only if the daemon is configured to have turned it off, and never fatal: the
+# fans are already back on the automatic curve at this point.
+if [ "$DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE" = "true" ]; then
+    ipmi raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 0x00 0x00 0x00 >/dev/null ||
+        echo "Warning: failed to re-enable the third-party PCIe cooling response." >&2
+fi

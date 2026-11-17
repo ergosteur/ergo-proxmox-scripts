@@ -58,6 +58,15 @@ set_auto() {
     "${IPMITOOL[@]}" raw 0x30 0x30 0x01 0x01 >/dev/null
 }
 
+# The third-party PCIe card cooling response is a persistent BMC setting, so
+# whatever we change at startup has to be put back when we stop. The last data
+# byte is the switch: 0x01 disables Dell's response, 0x00 enables it. Reading it
+# back with "raw 0x30 0xce 0x01 0x16 0x05 0x00 0x00 0x00" returns the same
+# bytes, so 16 05 00 00 00 05 00 01 00 00 means disabled.
+set_pcie_response() {
+    "${IPMITOOL[@]}" raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 "$1" 0x00 0x00 >/dev/null 2>&1
+}
+
 # The BMC can drop out of manual mode on its own (observed on a PowerEdge T630
 # with no SEL entry and nothing in the journal), after which the fans silently
 # follow the automatic curve while we still believe they are pinned. There is no
@@ -87,12 +96,19 @@ MODE=""
 cleanup() {
     log "Stopping: returning fan control to the BMC automatic curve."
     set_auto || log "Warning: failed to restore automatic fan control."
+    if [[ "$DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE" == "true" ]]; then
+        if set_pcie_response 0x00; then
+            log "Re-enabled the third-party PCIe card default cooling response."
+        else
+            log "Warning: failed to re-enable the third-party PCIe cooling response."
+        fi
+    fi
     exit 0
 }
 trap cleanup TERM INT
 
 if [[ "$DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE" == "true" ]]; then
-    if "${IPMITOOL[@]}" raw 0x30 0xce 0x00 0x16 0x05 0x00 0x00 0x00 0x05 0x00 0x01 0x00 0x00 >/dev/null 2>&1; then
+    if set_pcie_response 0x01; then
         log "Disabled the third-party PCIe card default cooling response."
     else
         log "Warning: could not disable the third-party PCIe cooling response."
