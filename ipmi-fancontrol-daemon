@@ -9,6 +9,10 @@
 #
 # Run under ipmi-fancontrol.service. Configuration lives in
 # conf/ipmi-fancontrol.conf (see conf/ipmi-fancontrol.conf.example).
+#
+# Another controller (ipmi-fancontrol-tui) can take over the fans by writing its
+# PID to the override file. While that PID is alive the daemon stands down and
+# touches nothing; if the controller exits or dies, the daemon resumes by itself.
 
 set -uo pipefail
 
@@ -30,6 +34,7 @@ fi
 : "${CPU_TEMP_HYSTERESIS:=5}"
 : "${CHECK_INTERVAL:=60}"
 : "${DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE:=false}"
+: "${OVERRIDE_FILE:=/run/ipmi-fancontrol.override}"
 
 RESUME_AT=$((CPU_TEMP_THRESHOLD - CPU_TEMP_HYSTERESIS))
 
@@ -76,6 +81,18 @@ reassert_manual() {
     set_manual || log "Warning: failed to re-assert manual fan control."
 }
 
+# True while another controller has claimed the fans. The override file holds its
+# PID, so a controller that crashes without cleaning up releases the fans anyway.
+OVERRIDE_PID=""
+override_active() {
+    OVERRIDE_PID=""
+    [[ -r "$OVERRIDE_FILE" ]] || return 1
+    local pid=""
+    read -r pid < "$OVERRIDE_FILE" || [[ -n "$pid" ]] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+    OVERRIDE_PID=$pid
+}
+
 # Highest CPU temperature in degrees C, or empty if none could be read.
 # CPU sensors are entity 3.x; 7.x is the system board (inlet/exhaust).
 max_cpu_temp() {
@@ -117,7 +134,9 @@ fi
 
 log "Starting: fans held at $FAN_SPEED below ${CPU_TEMP_THRESHOLD}C, automatic at or above it, re-engaging at ${RESUME_AT}C. Polling every ${CHECK_INTERVAL}s over $IPMI_INTERFACE."
 
-while true; do
+# One pass of the control loop: read the CPUs, then pick manual or automatic.
+poll_once() {
+    local temp
     temp=$(max_cpu_temp)
 
     if [[ -z "$temp" ]]; then
@@ -144,6 +163,25 @@ while true; do
         # Inside the hysteresis band we deliberately keep whatever mode we are
         # in, but still re-assert manual: see reassert_manual.
         reassert_manual
+    fi
+}
+
+STANDING_DOWN=0
+while true; do
+    if override_active; then
+        if (( ! STANDING_DOWN )); then
+            log "Override held by PID ${OVERRIDE_PID}: standing down, leaving the fans alone."
+            STANDING_DOWN=1
+        fi
+        # Forget our mode so the first pass after the override re-decides from
+        # scratch, whatever state the other controller left the fans in.
+        MODE=""
+    else
+        if (( STANDING_DOWN )); then
+            log "Override released: resuming control."
+            STANDING_DOWN=0
+        fi
+        poll_once
     fi
 
     # Backgrounded so that SIGTERM interrupts the wait instead of being deferred

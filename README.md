@@ -132,11 +132,45 @@ Run it in a clone, not on the Proxmox host. It edits
 git checkout, running it there would silently drift the host from this
 repository.
 
+## Fan control
+
+`ipmi-fancontrol-daemon` (run by `ipmi-fancontrol.service`) holds the fans at the
+duty set in `conf/ipmi-fancontrol.conf` while the CPUs are cool, re-sending it every
+poll because the BMC has been seen to drop manual mode on its own, and hands back to
+the BMC's curve at `CPU_TEMP_THRESHOLD`.
+
+`ipmi-fancontrol-tui` is a terminal dashboard for it: live temperatures and fan RPMs,
+a Manual / BMC auto / Hands off switch, and a duty slider with buttons.
+
+```sh
+ssh -t root@pet630 /opt/ergosteur/ipmi-fancontrol-tui     # the dashboard
+/opt/ergosteur/ipmi-fancontrol-tui --check                # print one reading, change nothing
+```
+
+It needs [uv](https://docs.astral.sh/uv/): the script declares its own dependency
+(Textual), which uv fetches on first run. It also needs root for the local `open`
+interface.
+
+- **Hands off** (the default) only reads. Nothing is sent and the daemon stays in
+  charge. Choosing **BMC auto** or **Manual** writes the TUI's PID to
+  `/run/ipmi-fancontrol.override` (`OVERRIDE_FILE` in the config), and the daemon
+  stands down for as long as that PID is alive. If the TUI crashes or loses its SSH
+  session the PID goes stale and the daemon resumes by itself within one poll.
+- **Manual has no thermal response**, so it drops back to BMC auto if a CPU reaches
+  `CPU_TEMP_THRESHOLD`, if the temperatures cannot be read for three polls, and when
+  you quit. It will not enter manual mode while the CPU temperature is unknown or
+  already at the threshold. The slider floor is 5 %.
+- The BMC's fan mode cannot be read back, so while in manual the TUI re-sends the
+  speed every 15 s.
+- Keys: `m` manual, `b` BMC auto, `h` hands off, `+`/`-` change the duty by 5, `q`
+  quits; the slider takes the arrow keys (1), PgUp/PgDn (5), Home/End, or the mouse.
+
 ## Other tooling
 
 | Path | What it does |
 | --- | --- |
 | `ipmi-fancontrol-daemon` | Temperature-aware fan control for Dell PowerEdge/iDRAC: holds a fixed low duty while cool, hands back to the BMC curve under load. Run by `ipmi-fancontrol.service`. |
+| `ipmi-fancontrol-tui` | Terminal dashboard: live temps and RPMs, manual/BMC switch, duty slider. The daemon stands down while it is in control. See [Fan control](#fan-control). |
 | `ipmi-fancontrol-manual` | Ad-hoc override pinning the fans to a fixed speed. Does not ramp under load. |
 | `ipmi-fancontrol-auto` | Hands fan control back to the BMC's automatic curve. Also the `ExecStopPost` backstop. |
 | `setup-nut-synology.sh` | Sets up NUT for a USB UPS and serves it to a Synology. See [`nut/README.md`](nut/README.md). |

@@ -38,3 +38,7 @@ CHECK_INTERVAL=60
 # Dell raises the fan floor whenever it sees a third-party PCIe card. Set true to
 # suppress that, which is usually what you want with aftermarket NICs or HBAs.
 DISABLE_THIRD_PARTY_PCIE_COOLING_RESPONSE=false
+
+# The daemon stands down while a live PID is written here, which is how
+# ipmi-fancontrol-tui takes the fans over. Rarely needs changing.
+#OVERRIDE_FILE=/run/ipmi-fancontrol.override

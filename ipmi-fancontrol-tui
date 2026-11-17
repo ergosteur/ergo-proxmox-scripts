@@ -1,0 +1,645 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["textual>=8"]
+# ///
+"""Terminal dashboard for Dell PowerEdge / iDRAC fan control.
+
+Shows live temperatures and fan RPMs, and lets you take the fans over by hand:
+
+  Hands off   send nothing; whatever is in control (the daemon, the BMC) stays so
+  BMC auto    force the BMC's automatic curve
+  Manual      pin all fans to a duty you choose with the slider or buttons
+
+While you are in BMC auto or Manual this writes its PID to the override file, so
+ipmi-fancontrol-daemon stands down instead of fighting you. If this program dies,
+the PID goes stale and the daemon resumes by itself within one poll.
+
+Manual mode has no thermal response. It drops back to BMC auto if a CPU reaches
+CPU_TEMP_THRESHOLD or the temperatures cannot be read, and on quit.
+
+Reads conf/ipmi-fancontrol.conf like the shell scripts do. Needs root for the local
+"open" interface. Run it directly (uv fetches Textual on first use):
+
+    ./ipmi-fancontrol-tui           the dashboard
+    ./ipmi-fancontrol-tui --check   print one reading and exit; changes nothing
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import os
+import re
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration, ipmitool, parsing. No Textual in this half, so --check works
+# (and can be tested) without the UI.
+# ---------------------------------------------------------------------------
+
+MIN_DUTY = 5  # percent; below this some fans stall
+MAX_DUTY = 100
+REASSERT_EVERY = 15.0  # seconds; the BMC has been seen to drop manual mode silently
+SENSOR_FAILS_BEFORE_FALLBACK = 3
+
+
+@dataclass
+class Config:
+    interface: str = "open"
+    host: str = ""
+    user: str = ""
+    password: str = ""
+    fan_speed: int = 21  # percent, from FAN_SPEED=0x15
+    threshold: int = 70
+    override_file: Path = Path("/run/ipmi-fancontrol.override")
+    service: str = "ipmi-fancontrol"
+    source: str = "defaults (no config found)"
+
+
+def parse_conf(text: str) -> dict[str, str]:
+    """Read KEY=VALUE lines from the shell config without executing it."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        value = m.group(2).strip()
+        if value[:1] in "\"'":
+            end = value.find(value[0], 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        out[m.group(1)] = value
+    return out
+
+
+def load_config() -> Config:
+    here = Path(__file__).resolve().parent
+    path = Path(os.environ.get("IPMI_FANCONTROL_CONFIG", here / "conf/ipmi-fancontrol.conf"))
+    cfg = Config()
+    try:
+        conf = parse_conf(path.read_text())
+    except OSError:
+        return cfg
+    cfg.source = str(path)
+    cfg.interface = conf.get("IPMI_INTERFACE", cfg.interface)
+    cfg.host = conf.get("IPMI_HOST", "")
+    cfg.user = conf.get("IPMI_USER", "")
+    cfg.password = conf.get("IPMI_PASSWORD", "")
+    try:
+        cfg.fan_speed = int(conf.get("FAN_SPEED", str(cfg.fan_speed)), 0)
+    except ValueError:
+        pass
+    try:
+        cfg.threshold = int(conf.get("CPU_TEMP_THRESHOLD", str(cfg.threshold)))
+    except ValueError:
+        pass
+    if "OVERRIDE_FILE" in conf:
+        cfg.override_file = Path(conf["OVERRIDE_FILE"])
+    return cfg
+
+
+class Ipmi:
+    """Thin async wrapper around ipmitool, built the way the shell scripts do."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.env = os.environ.copy()
+        if cfg.interface == "lanplus":
+            # -E reads the password from the environment, keeping it out of argv.
+            self.base = ["ipmitool", "-I", "lanplus", "-H", cfg.host, "-U", cfg.user, "-E"]
+            self.env["IPMI_PASSWORD"] = cfg.password
+        else:
+            self.base = ["ipmitool", "-I", "open"]
+
+    async def run(self, *args: str, timeout: float = 20.0) -> tuple[int, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.base,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.env,
+            )
+        except FileNotFoundError:
+            return 127, "ipmitool not found"
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "ipmitool timed out"
+        rc = proc.returncode or 0
+        return rc, (out if rc == 0 else err or out).decode(errors="replace").strip()
+
+
+@dataclass
+class Reading:
+    label: str
+    entity: str
+    status: str
+    value: int | None  # degrees C or RPM; None when there is no numeric reading
+    text: str
+
+
+def parse_sdr(text: str) -> list[Reading]:
+    """Parse `ipmitool sdr type ...` rows: name | id | status | entity | reading."""
+    rows: list[Reading] = []
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 5:
+            continue
+        name, _id, status, entity, reading = parts[:5]
+        m = re.search(r"-?\d+", reading)
+        value = int(m.group()) if m and re.search(r"degrees C|RPM", reading) else None
+        label = name
+        if entity.startswith("3.") and name == "Temp":  # CPU sensors are entity 3.x
+            label = f"CPU{entity.split('.')[1]}"
+        rows.append(Reading(label, entity, status, value, reading))
+    return rows
+
+
+def max_cpu_temp(temps: list[Reading]) -> int | None:
+    vals = [r.value for r in temps if r.entity.startswith("3.") and r.value is not None]
+    return max(vals) if vals else None
+
+
+def duty_hex(percent: int) -> str:
+    return f"0x{percent:02x}"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def check() -> int:
+    cfg = load_config()
+    ipmi = Ipmi(cfg)
+    print(f"config:    {cfg.source}")
+    print(f"interface: {cfg.interface}   threshold: {cfg.threshold}C   default duty: {cfg.fan_speed}%")
+    pid = read_pid(cfg.override_file)
+    held = f"held by PID {pid}{'' if pid and pid_alive(pid) else ' (stale)'}" if pid else "none"
+    print(f"override:  {held}")
+    (rc_t, out_t), (rc_f, out_f) = await asyncio.gather(
+        ipmi.run("sdr", "type", "temperature"), ipmi.run("sdr", "type", "fan")
+    )
+    if rc_t or rc_f:
+        print(f"ipmitool failed: {out_t if rc_t else out_f}", file=sys.stderr)
+        return 1
+    for r in parse_sdr(out_t) + parse_sdr(out_f):
+        print(f"  {r.label:<16} {r.text}")
+    return 0
+
+
+if __name__ == "__main__" and "--check" in sys.argv:
+    sys.exit(asyncio.run(check()))
+if __name__ == "__main__" and any(a in sys.argv for a in ("-h", "--help")):
+    print(__doc__)
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# The UI.
+# ---------------------------------------------------------------------------
+
+from rich.text import Text  # noqa: E402  (Textual depends on rich)
+from textual import events  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import Horizontal, Vertical  # noqa: E402
+from textual.message import Message  # noqa: E402
+from textual.reactive import reactive  # noqa: E402
+from textual.widget import Widget  # noqa: E402
+from textual.widgets import Button, Footer, Header, RichLog, Static  # noqa: E402
+
+LABEL_W = 6  # width of the "100%  " prefix inside the slider
+
+
+class Slider(Widget, can_focus=True):
+    """A horizontal duty slider: arrows +/-1, PgUp/PgDn +/-5, Home/End, mouse."""
+
+    DEFAULT_CSS = """
+    Slider { height: 3; border: round $primary; padding: 0 1; }
+    Slider:focus { border: round $accent; }
+    """
+    BINDINGS = [
+        Binding("left", "step(-1)", "-1", show=False),
+        Binding("right", "step(1)", "+1", show=False),
+        Binding("pagedown", "step(-5)", "-5", show=False),
+        Binding("pageup", "step(5)", "+5", show=False),
+        Binding("home", "step(-100)", "min", show=False),
+        Binding("end", "step(100)", "max", show=False),
+    ]
+
+    value: reactive[int] = reactive(MIN_DUTY)
+
+    class Changed(Message):
+        def __init__(self, slider: "Slider", value: int) -> None:
+            super().__init__()
+            self.slider = slider
+            self.value = value
+
+    def __init__(self, value: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.set_reactive(Slider.value, self.validate_value(value))
+
+    def validate_value(self, value: int) -> int:
+        return max(MIN_DUTY, min(MAX_DUTY, int(value)))
+
+    def watch_value(self, value: int) -> None:
+        self.post_message(self.Changed(self, value))
+
+    def action_step(self, delta: int) -> None:
+        self.value += delta
+
+    def _bar_width(self) -> int:
+        return max(self.content_size.width - LABEL_W, 2)
+
+    def render(self) -> Text:
+        width = self._bar_width()
+        frac = (self.value - MIN_DUTY) / (MAX_DUTY - MIN_DUTY)
+        pos = round(frac * (width - 1))
+        out = Text(f"{self.value:>3}%  ", style="bold")
+        for i in range(width):
+            if i < pos:
+                out.append("━", style="green")
+            elif i == pos:
+                out.append("●", style="bold white")
+            else:
+                out.append("─", style="grey50")
+        return out
+
+    def _set_from_x(self, x: int) -> None:
+        col = x - 2 - LABEL_W  # 1 cell of border + 1 of padding on the left
+        frac = min(max(col / (self._bar_width() - 1), 0.0), 1.0)
+        self.value = round(MIN_DUTY + frac * (MAX_DUTY - MIN_DUTY))
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self.focus()
+        self.capture_mouse()
+        self._set_from_x(event.x)
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.app.mouse_captured is self:
+            self._set_from_x(event.x)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        self.release_mouse()
+
+
+def bar(frac: float, width: int = 24) -> str:
+    frac = min(max(frac, 0.0), 1.0)
+    filled = round(frac * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+MODE_LABELS = {"hands": "HANDS OFF", "bmc": "BMC AUTO", "manual": "MANUAL"}
+
+
+class FanApp(App):
+    TITLE = "IPMI fan control"
+    CSS = """
+    #status { padding: 0 1; height: 3; content-align: left middle; }
+    #panels { height: auto; }
+    #temps, #fans { width: 1fr; height: auto; border: round $primary; padding: 0 1; }
+    #controls { height: auto; border: round $primary; padding: 0 1; }
+    #modes, #presets { height: auto; }
+    Button { margin: 0 1 0 0; min-width: 12; }
+    Button.active { background: $success; color: $text; text-style: bold; }
+    #log { height: 1fr; min-height: 5; border: round $primary; }
+    """
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("h", "set_mode('hands')", "Hands off"),
+        Binding("b", "set_mode('bmc')", "BMC auto"),
+        Binding("m", "set_mode('manual')", "Manual"),
+        Binding("plus,equals_sign", "bump(5)", "+5%"),
+        Binding("minus", "bump(-5)", "-5%"),
+    ]
+
+    def __init__(self, cfg: Config | None = None, poll_interval: float = 2.0) -> None:
+        super().__init__()
+        self.cfg = cfg or load_config()
+        self.ipmi = Ipmi(self.cfg)
+        self.poll_interval = poll_interval
+        self.mode = "hands"
+        self.temps: list[Reading] = []
+        self.fans: list[Reading] = []
+        self.max_cpu: int | None = None
+        self.sensor_fails = 0
+        self.max_rpm_seen = 5000
+        self.service_state = "?"
+        self._service_checked = 0.0
+        self._last_write = 0.0
+        self._lock = asyncio.Lock()
+        self._apply_timer = None
+        self._quitting = False
+        atexit.register(self._release_sync)
+
+    # -- layout -----------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static(id="status")
+        with Horizontal(id="panels"):
+            yield Static(id="temps")
+            yield Static(id="fans")
+        with Vertical(id="controls"):
+            with Horizontal(id="modes"):
+                yield Button("Hands off", id="mode-hands")
+                yield Button("BMC auto", id="mode-bmc")
+                yield Button("Manual", id="mode-manual")
+            yield Slider(min(max(self.cfg.fan_speed, MIN_DUTY), MAX_DUTY), id="slider")
+            with Horizontal(id="presets"):
+                yield Button("-5", id="bump-down")
+                yield Button("+5", id="bump-up")
+                for pct in (10, 20, 30, 50, 100):
+                    yield Button(f"{pct}%", id=f"preset-{pct}")
+        yield RichLog(id="log", wrap=True, markup=False, highlight=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.sub_title = f"{self.cfg.interface}  threshold {self.cfg.threshold}C"
+        self.note(f"config: {self.cfg.source}")
+        self._refresh_all()
+        self.query_one("#slider", Slider).focus()
+        self.run_worker(self._poll_loop(), exclusive=True)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.action_quit()))
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+
+    # -- small helpers ----------------------------------------------------
+
+    @property
+    def slider(self) -> Slider:
+        return self.query_one("#slider", Slider)
+
+    def note(self, message: str) -> None:
+        self.query_one("#log", RichLog).write(f"{time.strftime('%H:%M:%S')}  {message}")
+
+    # -- override file (so the daemon stands down) ------------------------
+
+    def claim(self) -> bool:
+        path = self.cfg.override_file
+        holder = read_pid(path)
+        if holder and holder != os.getpid() and pid_alive(holder):
+            self.note(f"override already held by PID {holder}; not taking over")
+            return False
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(f"{os.getpid()}\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.note(f"cannot write override file {path}: {exc}")
+            return False
+        return True
+
+    def _release_sync(self) -> None:
+        path = self.cfg.override_file
+        if read_pid(path) == os.getpid():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    # -- talking to the BMC ----------------------------------------------
+
+    async def send_auto(self) -> bool:
+        rc, out = await self.ipmi.run("raw", "0x30", "0x30", "0x01", "0x01")
+        self._last_write = time.monotonic()
+        if rc:
+            self.note(f"failed to hand fans to the BMC: {out}")
+        return rc == 0
+
+    async def send_manual(self) -> bool:
+        pct = self.slider.value
+        rc, out = await self.ipmi.run("raw", "0x30", "0x30", "0x01", "0x00")
+        if rc == 0:
+            rc, out = await self.ipmi.run("raw", "0x30", "0x30", "0x02", "0xff", duty_hex(pct))
+        self._last_write = time.monotonic()
+        if rc:
+            self.note(f"failed to set manual fan speed: {out}")
+        return rc == 0
+
+    async def set_mode(self, new: str) -> None:
+        async with self._lock:
+            old = self.mode
+            if new == old:
+                return
+            if new == "hands":
+                if old == "manual" and not await self.send_auto():
+                    return
+                self._release_sync()
+                self.mode = "hands"
+                self.note("hands off: the daemon (if running) resumes within one poll")
+            else:
+                if new == "manual" and (self.max_cpu is None or self.max_cpu >= self.cfg.threshold):
+                    shown = "unknown" if self.max_cpu is None else f"{self.max_cpu}C"
+                    self.note(f"refusing manual mode: CPU temperature is {shown}")
+                    self.notify("Manual refused: CPU temperature unknown or too high", severity="warning")
+                    return
+                if not self.claim():
+                    return
+                ok = await (self.send_auto() if new == "bmc" else self.send_manual())
+                if not ok:
+                    if old == "hands":
+                        self._release_sync()
+                    return
+                self.mode = new
+                if new == "manual":
+                    self.note(f"manual: all fans pinned to {self.slider.value}%")
+                else:
+                    self.note("BMC auto: the daemon is standing down")
+        self._refresh_all()
+
+    async def fall_back(self, reason: str) -> None:
+        async with self._lock:
+            if self.mode != "manual":
+                return
+            self.mode = "bmc"
+            await self.send_auto()
+        self.note(f"SAFETY: {reason}; handed the fans to the BMC")
+        self.notify(f"{reason}: back to BMC auto", severity="error", timeout=10)
+        self._refresh_all()
+
+    async def _apply_speed(self) -> None:
+        if self.mode != "manual":
+            return
+        async with self._lock:
+            if self.mode == "manual" and await self.send_manual():
+                self.note(f"fans set to {self.slider.value}%")
+
+    async def _release_and_stop(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        async with self._lock:
+            if self.mode == "manual":
+                await self.send_auto()
+            self._release_sync()
+            self.mode = "hands"
+
+    async def action_quit(self) -> None:
+        await self._release_and_stop()
+        self.exit()
+
+    # -- polling ----------------------------------------------------------
+
+    async def _poll_loop(self) -> None:
+        while True:
+            await self.poll()
+            await asyncio.sleep(self.poll_interval)
+
+    async def poll(self) -> None:
+        (rc_t, out_t), (rc_f, out_f) = await asyncio.gather(
+            self.ipmi.run("sdr", "type", "temperature"), self.ipmi.run("sdr", "type", "fan")
+        )
+        if rc_f == 0:
+            self.fans = parse_sdr(out_f)
+            rpms = [r.value for r in self.fans if r.value is not None]
+            self.max_rpm_seen = max([self.max_rpm_seen, *rpms])
+        if rc_t == 0:
+            self.temps = parse_sdr(out_t)
+            self.max_cpu = max_cpu_temp(self.temps)
+        else:
+            self.max_cpu = None
+        if self.max_cpu is None:
+            self.sensor_fails += 1
+        else:
+            self.sensor_fails = 0
+        if time.monotonic() - self._service_checked > 5:
+            self._service_checked = time.monotonic()
+            self.service_state = await self._service_state()
+        self._refresh_all()
+
+        if self.mode == "manual":
+            if self.max_cpu is not None and self.max_cpu >= self.cfg.threshold:
+                await self.fall_back(f"CPU at {self.max_cpu}C, at or above {self.cfg.threshold}C")
+            elif self.sensor_fails >= SENSOR_FAILS_BEFORE_FALLBACK:
+                await self.fall_back("cannot read CPU temperature")
+            elif time.monotonic() - self._last_write >= REASSERT_EVERY:
+                # No way to read the mode back, so re-send it in case the BMC dropped it.
+                async with self._lock:
+                    if self.mode == "manual":
+                        await self.send_manual()
+
+    async def _service_state(self) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", self.cfg.service,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), 5)
+            return out.decode().strip() or "unknown"
+        except (OSError, asyncio.TimeoutError):
+            return "n/a"
+
+    # -- rendering --------------------------------------------------------
+
+    def _temp_style(self, r: Reading) -> str:
+        v = r.value or 0
+        if r.entity.startswith("3."):
+            hot, warm = self.cfg.threshold, self.cfg.threshold - 15
+        else:
+            hot, warm = 45, 35
+        return "red" if v >= hot else "yellow" if v >= warm else "green"
+
+    def _refresh_all(self) -> None:
+        # Panels.
+        t = Text("Temperatures\n", style="bold")
+        if not self.temps:
+            t.append("  waiting for sensors...", style="grey50")
+        for r in self.temps:
+            if r.value is None:
+                t.append(f"  {r.label:<10} {r.text}\n", style="grey50")
+                continue
+            t.append(f"  {r.label:<10} ")
+            t.append(bar(r.value / 100), style=self._temp_style(r))
+            t.append(f" {r.value:>3}°C\n")
+        self.query_one("#temps", Static).update(t)
+
+        f = Text("Fans\n", style="bold")
+        if not self.fans:
+            f.append("  waiting for sensors...", style="grey50")
+        for r in self.fans:
+            if r.value is None:
+                style = "green" if r.status == "ok" else "red"
+                f.append(f"  {r.label:<14} {r.text}\n", style=style)
+                continue
+            f.append(f"  {r.label:<8} ")
+            f.append(bar(r.value / self.max_rpm_seen), style="cyan" if r.status == "ok" else "red")
+            f.append(f" {r.value:>5} RPM\n")
+        self.query_one("#fans", Static).update(f)
+
+        # Status line.
+        s = Text()
+        s.append("Mode: ")
+        mode_style = {"hands": "bold", "bmc": "bold cyan", "manual": "bold yellow"}[self.mode]
+        s.append(MODE_LABELS[self.mode], style=mode_style)
+        if self.mode == "manual":
+            s.append(" ")
+            s.append(f"at {self.slider.value}%", style="bold yellow")
+        s.append("    Daemon: ")
+        standing = self.mode != "hands" and self.service_state == "active"
+        s.append(f"{self.service_state}{' (standing down)' if standing else ''}")
+        s.append("    CPU max: ")
+        if self.max_cpu is None:
+            s.append("?", style="red")
+        else:
+            s.append(f"{self.max_cpu}°C", style="red" if self.max_cpu >= self.cfg.threshold else "")
+        s.append(f" / {self.cfg.threshold}°C")
+        self.query_one("#status", Static).update(s)
+
+        for name in ("hands", "bmc", "manual"):
+            self.query_one(f"#mode-{name}", Button).set_class(self.mode == name, "active")
+
+    # -- events -----------------------------------------------------------
+
+    def on_slider_changed(self, event: Slider.Changed) -> None:
+        self._refresh_all()
+        if self.mode == "manual":
+            if self._apply_timer is not None:
+                self._apply_timer.stop()
+            # Debounce: dragging the slider should not fire a command per cell.
+            self._apply_timer = self.set_timer(0.5, self._apply_speed)
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid.startswith("mode-"):
+            await self.set_mode(bid.removeprefix("mode-"))
+        elif bid == "bump-up":
+            self.slider.value += 5
+        elif bid == "bump-down":
+            self.slider.value -= 5
+        elif bid.startswith("preset-"):
+            self.slider.value = int(bid.removeprefix("preset-"))
+        self.slider.focus()
+
+    async def action_set_mode(self, mode: str) -> None:
+        await self.set_mode(mode)
+
+    def action_bump(self, delta: int) -> None:
+        self.slider.value += delta
+
+
+if __name__ == "__main__":
+    FanApp().run()
