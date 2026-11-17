@@ -7,16 +7,23 @@
 
 Shows live temperatures and fan RPMs, and lets you take the fans over by hand:
 
-  Hands off   send nothing; whatever is in control (the daemon, the BMC) stays so
-  BMC auto    force the BMC's automatic curve
-  Manual      pin all fans to a duty you choose with the slider or buttons
+  AUTO    Daemon control  send nothing; the fan control daemon stays in charge
+          BMC control     force the BMC's own automatic curve
+  Manual                  pin all fans to a duty you choose with the slider
 
-While you are in BMC auto or Manual this writes its PID to the override file, so
+Moving the slider or pressing a duty button switches to Manual by itself, and going
+back to Daemon control puts the slider back on the daemon's hold speed. You can also
+start, stop or restart the fan control daemon service from here, and save the slider's
+value as the daemon's hold speed (FAN_SPEED in the config; applied on its next restart).
+
+While you are in BMC control or Manual this writes its PID to the override file, so
 ipmi-fancontrol-daemon stands down instead of fighting you. If this program dies,
 the PID goes stale and the daemon resumes by itself within one poll.
 
-Manual mode has no thermal response. It drops back to BMC auto if a CPU reaches
-CPU_TEMP_THRESHOLD or the temperatures cannot be read, and on quit.
+Manual mode has no thermal response. It drops back to BMC control if a CPU reaches
+CPU_TEMP_THRESHOLD or the temperatures cannot be read, on quit, and in a last-resort
+exit handler if the program crashes. (If the daemon is stopped and the program is
+killed outright with SIGKILL, nothing can restore the fans.)
 
 Reads conf/ipmi-fancontrol.conf like the shell scripts do. Needs root for the local
 "open" interface. Run it directly (uv fetches Textual on first use):
@@ -32,6 +39,7 @@ import atexit
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -59,6 +67,7 @@ class Config:
     override_file: Path = Path("/run/ipmi-fancontrol.override")
     service: str = "ipmi-fancontrol"
     source: str = "defaults (no config found)"
+    path: Path | None = None  # None when there is no config file to read or edit
 
 
 def parse_conf(text: str) -> dict[str, str]:
@@ -87,6 +96,7 @@ def load_config() -> Config:
     except OSError:
         return cfg
     cfg.source = str(path)
+    cfg.path = path
     cfg.interface = conf.get("IPMI_INTERFACE", cfg.interface)
     cfg.host = conf.get("IPMI_HOST", "")
     cfg.user = conf.get("IPMI_USER", "")
@@ -102,6 +112,38 @@ def load_config() -> Config:
     if "OVERRIDE_FILE" in conf:
         cfg.override_file = Path(conf["OVERRIDE_FILE"])
     return cfg
+
+
+def save_fan_speed(path: Path, percent: int) -> None:
+    """Set FAN_SPEED=<hex> in the shell config, leaving everything else untouched.
+
+    Replaces the last active FAN_SPEED= line (that is the one that wins when the
+    file is sourced) or appends one. The write is atomic and keeps the file's mode
+    and ownership, which matters because the config can hold the BMC password.
+    """
+    text = path.read_text()
+    value = f"0x{percent:02x}"
+    matches = list(re.finditer(r"^([ \t]*(?:export[ \t]+)?FAN_SPEED=).*$", text, re.MULTILINE))
+    if matches:
+        m = matches[-1]
+        new = text[: m.start()] + m.group(1) + value + text[m.end():]
+    else:
+        new = text + ("" if text.endswith("\n") or not text else "\n") + f"FAN_SPEED={value}\n"
+    st = path.stat()
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(new)
+        os.chmod(tmp, st.st_mode & 0o777)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 class Ipmi:
@@ -250,6 +292,17 @@ class Slider(Widget, can_focus=True):
     value: reactive[int] = reactive(MIN_DUTY)
 
     class Changed(Message):
+        """The value changed, from any source."""
+
+        def __init__(self, slider: "Slider", value: int) -> None:
+            super().__init__()
+            self.slider = slider
+            self.value = value
+
+    class Adjusted(Message):
+        """The user moved the slider or pressed a duty control, even if the value
+        ended up unchanged (pressing the 30% preset while already at 30%)."""
+
         def __init__(self, slider: "Slider", value: int) -> None:
             super().__init__()
             self.slider = slider
@@ -265,8 +318,12 @@ class Slider(Widget, can_focus=True):
     def watch_value(self, value: int) -> None:
         self.post_message(self.Changed(self, value))
 
+    def user_set(self, value: int) -> None:
+        self.value = value  # posts Changed if it differs
+        self.post_message(self.Adjusted(self, self.value))
+
     def action_step(self, delta: int) -> None:
-        self.value += delta
+        self.user_set(self.value + delta)
 
     def _bar_width(self) -> int:
         return max(self.content_size.width - LABEL_W, 2)
@@ -288,7 +345,7 @@ class Slider(Widget, can_focus=True):
     def _set_from_x(self, x: int) -> None:
         col = x - 2 - LABEL_W  # 1 cell of border + 1 of padding on the left
         frac = min(max(col / (self._bar_width() - 1), 0.0), 1.0)
-        self.value = round(MIN_DUTY + frac * (MAX_DUTY - MIN_DUTY))
+        self.user_set(round(MIN_DUTY + frac * (MAX_DUTY - MIN_DUTY)))
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         self.focus()
@@ -309,7 +366,7 @@ def bar(frac: float, width: int = 24) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-MODE_LABELS = {"hands": "HANDS OFF", "bmc": "BMC AUTO", "manual": "MANUAL"}
+MODE_LABELS = {"daemon": "DAEMON CONTROL", "bmc": "BMC CONTROL", "manual": "MANUAL"}
 
 
 class FanApp(App):
@@ -320,14 +377,19 @@ class FanApp(App):
     #temps, #fans { width: 1fr; height: auto; border: round $primary; padding: 0 1; }
     #controls { height: auto; border: round $primary; padding: 0 1; }
     #modes, #presets { height: auto; }
+    #auto-group { width: auto; height: auto; border: round $primary; padding: 0 1; }
+    #mode-manual { margin-top: 1; }
+    #service { height: auto; border: round $primary; padding: 0 1; }
+    #svc-row, #hold-row { height: auto; }
+    #svc-state, #hold-state { width: 1fr; height: 3; content-align: left middle; }
     Button { margin: 0 1 0 0; min-width: 12; }
     Button.active { background: $success; color: $text; text-style: bold; }
     #log { height: 1fr; min-height: 5; border: round $primary; }
     """
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("h", "set_mode('hands')", "Hands off"),
-        Binding("b", "set_mode('bmc')", "BMC auto"),
+        Binding("d", "set_mode('daemon')", "Daemon"),
+        Binding("b", "set_mode('bmc')", "BMC"),
         Binding("m", "set_mode('manual')", "Manual"),
         Binding("plus,equals_sign", "bump(5)", "+5%"),
         Binding("minus", "bump(-5)", "-5%"),
@@ -338,7 +400,7 @@ class FanApp(App):
         self.cfg = cfg or load_config()
         self.ipmi = Ipmi(self.cfg)
         self.poll_interval = poll_interval
-        self.mode = "hands"
+        self.mode = "daemon"
         self.temps: list[Reading] = []
         self.fans: list[Reading] = []
         self.max_cpu: int | None = None
@@ -350,7 +412,12 @@ class FanApp(App):
         self._lock = asyncio.Lock()
         self._apply_timer = None
         self._quitting = False
-        atexit.register(self._release_sync)
+        self._svc_busy = False
+        self.hold_pct = min(max(self.cfg.fan_speed, MIN_DUTY), MAX_DUTY)  # daemon's FAN_SPEED
+        self.hold_pending = False  # a hold speed was saved and the service has not restarted since
+        self._conf_mtime: float | None = None
+        self._svc_started: float | None = None
+        atexit.register(self._atexit_cleanup)
 
     # -- layout -----------------------------------------------------------
 
@@ -362,8 +429,9 @@ class FanApp(App):
             yield Static(id="fans")
         with Vertical(id="controls"):
             with Horizontal(id="modes"):
-                yield Button("Hands off", id="mode-hands")
-                yield Button("BMC auto", id="mode-bmc")
+                with Horizontal(id="auto-group"):
+                    yield Button("Daemon control", id="mode-daemon")
+                    yield Button("BMC control", id="mode-bmc")
                 yield Button("Manual", id="mode-manual")
             yield Slider(min(max(self.cfg.fan_speed, MIN_DUTY), MAX_DUTY), id="slider")
             with Horizontal(id="presets"):
@@ -371,11 +439,21 @@ class FanApp(App):
                 yield Button("+5", id="bump-up")
                 for pct in (10, 20, 30, 50, 100):
                     yield Button(f"{pct}%", id=f"preset-{pct}")
+        with Vertical(id="service"):
+            with Horizontal(id="svc-row"):
+                yield Static(id="svc-state")
+                yield Button("STOP", id="svc-toggle")
+                yield Button("RESTART", id="svc-restart")
+            with Horizontal(id="hold-row"):
+                yield Static(id="hold-state")
+                yield Button("Set hold", id="hold-save")
         yield RichLog(id="log", wrap=True, markup=False, highlight=False)
         yield Footer()
 
     def on_mount(self) -> None:
         self.sub_title = f"{self.cfg.interface}  threshold {self.cfg.threshold}C"
+        self.query_one("#auto-group").border_title = "AUTO"
+        self.query_one("#service").border_title = "Fan control daemon service"
         self.note(f"config: {self.cfg.source}")
         self._refresh_all()
         self.query_one("#slider", Slider).focus()
@@ -421,6 +499,20 @@ class FanApp(App):
             except OSError:
                 pass
 
+    def _atexit_cleanup(self) -> None:
+        """Last resort for a crash or unhandled exception: never leave the fans
+        pinned. A normal quit has already done this and set the mode back."""
+        if self.mode == "manual":
+            try:
+                subprocess.run(
+                    [*self.ipmi.base, "raw", "0x30", "0x30", "0x01", "0x01"],
+                    env=self.ipmi.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        self._release_sync()
+
     # -- talking to the BMC ----------------------------------------------
 
     async def send_auto(self) -> bool:
@@ -440,17 +532,26 @@ class FanApp(App):
             self.note(f"failed to set manual fan speed: {out}")
         return rc == 0
 
-    async def set_mode(self, new: str) -> None:
+    async def set_mode(self, new: str, *, require_daemon: bool = True) -> None:
         async with self._lock:
             old = self.mode
             if new == old:
                 return
-            if new == "hands":
+            if new == "daemon":
+                if require_daemon and self.service_state != "active":
+                    self.note("daemon control needs the daemon running: use START below")
+                    self.notify("The daemon is not running: START it first", severity="warning")
+                    return
                 if old == "manual" and not await self.send_auto():
                     return
                 self._release_sync()
-                self.mode = "hands"
-                self.note("hands off: the daemon (if running) resumes within one poll")
+                self.mode = "daemon"
+                if self._apply_timer is not None:
+                    self._apply_timer.stop()
+                # Show the daemon's own hold speed. Set after the mode, and
+                # programmatically, so it neither re-applies nor flips back to Manual.
+                self.slider.value = self.hold_pct
+                self.note(f"daemon control: the daemon resumes within one poll (hold speed {self.hold_pct}%)")
             else:
                 if new == "manual" and (self.max_cpu is None or self.max_cpu >= self.cfg.threshold):
                     shown = "unknown" if self.max_cpu is None else f"{self.max_cpu}C"
@@ -461,14 +562,14 @@ class FanApp(App):
                     return
                 ok = await (self.send_auto() if new == "bmc" else self.send_manual())
                 if not ok:
-                    if old == "hands":
+                    if old == "daemon":
                         self._release_sync()
                     return
                 self.mode = new
                 if new == "manual":
                     self.note(f"manual: all fans pinned to {self.slider.value}%")
                 else:
-                    self.note("BMC auto: the daemon is standing down")
+                    self.note("BMC control: the daemon is standing down")
         self._refresh_all()
 
     async def fall_back(self, reason: str) -> None:
@@ -478,7 +579,7 @@ class FanApp(App):
             self.mode = "bmc"
             await self.send_auto()
         self.note(f"SAFETY: {reason}; handed the fans to the BMC")
-        self.notify(f"{reason}: back to BMC auto", severity="error", timeout=10)
+        self.notify(f"{reason}: back to BMC control", severity="error", timeout=10)
         self._refresh_all()
 
     async def _apply_speed(self) -> None:
@@ -496,7 +597,7 @@ class FanApp(App):
             if self.mode == "manual":
                 await self.send_auto()
             self._release_sync()
-            self.mode = "hands"
+            self.mode = "daemon"
 
     async def action_quit(self) -> None:
         await self._release_and_stop()
@@ -529,6 +630,8 @@ class FanApp(App):
         if time.monotonic() - self._service_checked > 5:
             self._service_checked = time.monotonic()
             self.service_state = await self._service_state()
+            self._svc_started = await self._service_started()
+        self._reload_hold()
         self._refresh_all()
 
         if self.mode == "manual":
@@ -542,16 +645,122 @@ class FanApp(App):
                     if self.mode == "manual":
                         await self.send_manual()
 
-    async def _service_state(self) -> str:
+    async def _systemctl(self, *args: str, timeout: float = 30.0) -> tuple[int, str]:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "systemctl", "is-active", self.cfg.service,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                "systemctl", *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), 5)
-            return out.decode().strip() or "unknown"
-        except (OSError, asyncio.TimeoutError):
+        except OSError:
+            return 127, "systemctl not found"
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "systemctl timed out"
+        return proc.returncode or 0, (out or err).decode(errors="replace").strip()
+
+    async def _service_state(self) -> str:
+        rc, out = await self._systemctl("is-active", self.cfg.service, timeout=5)
+        if rc == 127:
             return "n/a"
+        return (out.splitlines() or ["unknown"])[0]
+
+    async def _service_started(self) -> float | None:
+        """Unix time the service last became active, or None if unknown."""
+        rc, out = await self._systemctl(
+            "show", "-p", "ActiveEnterTimestamp", "--timestamp=unix", self.cfg.service, timeout=5
+        )
+        m = re.search(r"=@(\d+)", out) if rc == 0 else None
+        return float(m.group(1)) if m else None
+
+    def _reload_hold(self) -> None:
+        """Pick up FAN_SPEED from disk, so edits made by hand show up too."""
+        path = self.cfg.path
+        if path is None:
+            return
+        try:
+            mtime = path.stat().st_mtime
+            if mtime == self._conf_mtime:
+                return
+            conf = parse_conf(path.read_text())
+        except OSError:
+            return
+        self._conf_mtime = mtime
+        old = self.hold_pct
+        try:
+            self.hold_pct = min(max(int(conf.get("FAN_SPEED", str(old)), 0), MIN_DUTY), MAX_DUTY)
+        except ValueError:
+            return
+        if self.hold_pct != old and self.mode == "daemon":
+            self.slider.value = self.hold_pct  # programmatic: does not switch to Manual
+
+    @property
+    def hold_unapplied(self) -> bool:
+        """True if the config on disk is newer than the running daemon."""
+        if self.hold_pending:
+            return True
+        return bool(self._conf_mtime and self._svc_started and self._conf_mtime > self._svc_started + 1)
+
+    async def save_hold(self) -> None:
+        path = self.cfg.path
+        if path is None:
+            self.note("no config file to edit; copy conf/ipmi-fancontrol.conf.example first")
+            return
+        pct = self.slider.value
+        try:
+            await asyncio.to_thread(save_fan_speed, path, pct)
+        except OSError as exc:
+            self.note(f"cannot save the hold speed to {path}: {exc}")
+            self.notify("Could not save the hold speed", severity="error")
+            return
+        self.hold_pct = pct
+        self.cfg.fan_speed = pct
+        self.hold_pending = True
+        try:
+            self._conf_mtime = path.stat().st_mtime
+        except OSError:
+            pass
+        self.note(f"saved FAN_SPEED={duty_hex(pct)} ({pct}%) to {path.name}; restart the service to apply")
+        self.notify(f"Hold speed {pct}% saved: restart the service to apply")
+        self._refresh_all()
+
+    async def _refresh_service(self) -> None:
+        self._service_checked = time.monotonic()
+        self.service_state = await self._service_state()
+        self._svc_started = await self._service_started()
+        self._refresh_all()
+
+    async def service_action(self, action: str) -> None:
+        if self._svc_busy:
+            return
+        self._svc_busy = True
+        try:
+            if action == "start" and self.mode != "daemon":
+                # Otherwise the daemon would start and immediately stand down.
+                await self.set_mode("daemon", require_daemon=False)
+                if self.mode != "daemon":
+                    return
+            self.note(f"systemctl {action} {self.cfg.service} ...")
+            rc, out = await self._systemctl(action, self.cfg.service)
+            if rc:
+                self.note(f"systemctl {action} failed: {out}")
+                self.notify(f"systemctl {action} failed", severity="error")
+            else:
+                self.note(f"systemctl {action}: done")
+                if action in ("start", "restart"):
+                    self.hold_pending = False
+            # The daemon's own stop path hands the fans to the BMC. If we are
+            # holding manual, put it straight back rather than wait for the re-send.
+            if self.mode == "manual":
+                async with self._lock:
+                    if self.mode == "manual":
+                        await self.send_manual()
+            await self._refresh_service()
+        finally:
+            self._svc_busy = False
+            self._refresh_all()
 
     # -- rendering --------------------------------------------------------
 
@@ -593,15 +802,15 @@ class FanApp(App):
         # Status line.
         s = Text()
         s.append("Mode: ")
-        mode_style = {"hands": "bold", "bmc": "bold cyan", "manual": "bold yellow"}[self.mode]
+        mode_style = {"daemon": "bold", "bmc": "bold cyan", "manual": "bold yellow"}[self.mode]
         s.append(MODE_LABELS[self.mode], style=mode_style)
         if self.mode == "manual":
             s.append(" ")
             s.append(f"at {self.slider.value}%", style="bold yellow")
-        s.append("    Daemon: ")
-        standing = self.mode != "hands" and self.service_state == "active"
-        s.append(f"{self.service_state}{' (standing down)' if standing else ''}")
-        s.append("    CPU max: ")
+        s.append("\u00a0\u00a0\u00a0\u00a0Service: ")
+        svc_style = {"active": "green", "failed": "red"}.get(self.service_state, "yellow")
+        s.append(self.service_state, style=svc_style)
+        s.append("\u00a0\u00a0\u00a0\u00a0CPU max: ")
         if self.max_cpu is None:
             s.append("?", style="red")
         else:
@@ -609,8 +818,42 @@ class FanApp(App):
         s.append(f" / {self.cfg.threshold}°C")
         self.query_one("#status", Static).update(s)
 
-        for name in ("hands", "bmc", "manual"):
+        for name in ("daemon", "bmc", "manual"):
             self.query_one(f"#mode-{name}", Button).set_class(self.mode == name, "active")
+
+        # Daemon service group.
+        state = self.service_state
+        running = state in ("active", "activating", "reloading")
+        v = Text()
+        v.append("● ", style="green" if state == "active" else "red" if state == "failed" else "yellow")
+        v.append(state)
+        if running and self.mode in ("bmc", "manual"):
+            v.append("\u00a0\u00a0(standing down while you are in control)", style="grey62")
+        elif not running and self.mode == "daemon":
+            v.append("\u00a0\u00a0(no controller: the BMC curve is in charge)", style="grey62")
+        self.query_one("#svc-state", Static).update(v)
+        h = Text()
+        if self.cfg.path is None:
+            h.append("Hold speed: n/a (no config file)", style="grey62")
+        else:
+            h.append(f"Hold speed: {self.hold_pct}%", style="bold")
+            h.append("\u00a0\u00a0(the daemon's fan duty while the CPUs are cool)", style="grey62")
+            if self.hold_unapplied:
+                h.append("\n")
+                h.append(
+                    "saved: restart the service to apply" if running
+                    else "saved: applies the next time the service starts",
+                    style="yellow",
+                )
+        self.query_one("#hold-state", Static).update(h)
+        save = self.query_one("#hold-save", Button)
+        save.label = f"Set hold {self.slider.value}%"
+        save.disabled = self.cfg.path is None or self.slider.value == self.hold_pct
+
+        toggle = self.query_one("#svc-toggle", Button)
+        toggle.label = "STOP" if running else "START"
+        toggle.disabled = state == "n/a"
+        self.query_one("#svc-restart", Button).disabled = state == "n/a"
 
     # -- events -----------------------------------------------------------
 
@@ -626,19 +869,32 @@ class FanApp(App):
         bid = event.button.id or ""
         if bid.startswith("mode-"):
             await self.set_mode(bid.removeprefix("mode-"))
+        elif bid == "hold-save":
+            await self.save_hold()
+        elif bid in ("svc-toggle", "svc-restart"):
+            running = self.service_state in ("active", "activating", "reloading")
+            action = "restart" if bid == "svc-restart" else "stop" if running else "start"
+            # A worker, so the UI stays responsive while systemctl runs.
+            self.run_worker(self.service_action(action), group="service")
         elif bid == "bump-up":
-            self.slider.value += 5
+            self.slider.user_set(self.slider.value + 5)
         elif bid == "bump-down":
-            self.slider.value -= 5
+            self.slider.user_set(self.slider.value - 5)
         elif bid.startswith("preset-"):
-            self.slider.value = int(bid.removeprefix("preset-"))
+            self.slider.user_set(int(bid.removeprefix("preset-")))
         self.slider.focus()
 
     async def action_set_mode(self, mode: str) -> None:
         await self.set_mode(mode)
 
     def action_bump(self, delta: int) -> None:
-        self.slider.value += delta
+        self.slider.user_set(self.slider.value + delta)
+
+    async def on_slider_adjusted(self, event: Slider.Adjusted) -> None:
+        # Asking for a fan speed means taking the fans over, so go to Manual. The
+        # usual checks still apply: if it is refused the slider just moves the target.
+        if self.mode != "manual":
+            await self.set_mode("manual")
 
 
 if __name__ == "__main__":
