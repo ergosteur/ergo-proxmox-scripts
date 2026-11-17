@@ -1,7 +1,8 @@
 #!/bin/bash
 # Temperature-aware IPMI fan control for Dell PowerEdge / iDRAC.
 #
-# Holds the fans at a fixed low duty while the CPUs are cool, and hands control
+# Holds the fans at a fixed low duty while the CPUs are cool (re-sending the
+# setting every poll, in case the BMC has reverted on its own), and hands control
 # back to the BMC's automatic curve once they get hot, so there is still a
 # thermal response under load. This is the native equivalent of the
 # tigerblue77/dell_idrac_fan_controller container, without needing Docker.
@@ -55,6 +56,15 @@ set_manual() {
 
 set_auto() {
     "${IPMITOOL[@]}" raw 0x30 0x30 0x01 0x01 >/dev/null
+}
+
+# The BMC can drop out of manual mode on its own (observed on a PowerEdge T630
+# with no SEL entry and nothing in the journal), after which the fans silently
+# follow the automatic curve while we still believe they are pinned. There is no
+# way to read the mode back, so re-send it on every poll while we want manual.
+# It is idempotent, and logs only on failure.
+reassert_manual() {
+    set_manual || log "Warning: failed to re-assert manual fan control."
 }
 
 # Highest CPU temperature in degrees C, or empty if none could be read.
@@ -111,9 +121,14 @@ while true; do
         if [[ "$MODE" != "manual" ]]; then
             log "CPU at ${temp}C, at or below ${RESUME_AT}C: holding fans at $FAN_SPEED."
             set_manual && MODE="manual"
+        else
+            reassert_manual
         fi
+    elif [[ "$MODE" == "manual" ]]; then
+        # Inside the hysteresis band we deliberately keep whatever mode we are
+        # in, but still re-assert manual: see reassert_manual.
+        reassert_manual
     fi
-    # Inside the hysteresis band we deliberately keep whatever mode we are in.
 
     # Backgrounded so that SIGTERM interrupts the wait instead of being deferred
     # until the sleep finishes.
