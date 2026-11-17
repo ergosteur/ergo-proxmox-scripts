@@ -140,13 +140,15 @@ poll because the BMC has been seen to drop manual mode on its own, and hands bac
 the BMC's curve at `CPU_TEMP_THRESHOLD`.
 
 `ipmi-fancontrol-tui` is a terminal dashboard for it: live temperatures and fan RPMs,
-and two groups of controls laid out like a car's climate panel.
+and controls laid out like a car's climate panel.
 
 ```
-              AUTO
- [Daemon control] [BMC control]   [Manual]     + duty slider and presets
- Fan control daemon service:  ● active         [STOP] [RESTART]
- Hold speed: 21%                                [Set hold 30%]
+ Mode: MANUAL at 30%    Service: active (standing down)    Hold: 21%    CPU max: 58°C / 70°C
+ ...temperatures and fans...
+ ┌─ AUTO ─────────────────────┐                      ┌─ FAN CONTROL DAEMON ──────────────┐
+ │ [Daemon control][BMC control] [Manual]             │ [STOP] [RESTART] [Set hold 30%]   │
+ └────────────────────────────┘                      └───────────────────────────────────┘
+ duty slider, then -5 / +5 / presets
 ```
 
 ```sh
@@ -156,7 +158,8 @@ ssh -t root@pet630 /opt/ergosteur/ipmi-fancontrol-tui     # the dashboard
 
 It needs [uv](https://docs.astral.sh/uv/): the script declares its own dependency
 (Textual), which uv fetches on first run. It also needs root for the local `open`
-interface. The top bar shows the mode, the systemd service state and the hottest CPU.
+interface. The top bar shows the mode, the systemd service state, the daemon's hold speed
+(`FAN_SPEED`) and the hottest CPU.
 
 - **Daemon control** (the default) only reads. Nothing is sent and the daemon stays
   in charge. **BMC control** forces the iDRAC's own curve, and **Manual** pins all fans
@@ -172,7 +175,7 @@ interface. The top bar shows the mode, the systemd service state and the hottest
   already at the threshold. The slider floor is 5 %. An exit handler also hands the
   fans to the BMC if the TUI crashes while in manual, which matters when the daemon
   is stopped and so cannot resume. Only SIGKILL gets past it.
-- **START / STOP** and **RESTART** drive the systemd service. The daemon's stop path
+- **START / STOP** and **RESTART**, in the FAN CONTROL DAEMON box, drive the systemd service. The daemon's stop path
   hands the fans to the BMC, so if you are in Manual the TUI puts the manual speed
   straight back. START switches to Daemon control first, otherwise the daemon would
   start and immediately stand down. There are no key bindings for these, to avoid
@@ -187,7 +190,14 @@ interface. The top bar shows the mode, the systemd service state and the hottest
 - The BMC's fan mode cannot be read back, so while in manual the TUI re-sends the
   speed every 15 s.
 - Keys: `d` daemon control, `b` BMC control, `m` manual, `+`/`-` change the duty by 5,
-  `q` quits; the slider takes the arrow keys (1), PgUp/PgDn (5), Home/End, or the mouse.
+  `q` quits, `c` compacts. The slider takes `←`/`→` (1), `Shift+←`/`Shift+→` (5) or the mouse.
+- `c` (or a click on either box) collapses the temperatures and fans to one colour-coded
+  line each: green, yellow or red temperatures against the threshold, cyan RPMs, and any
+  unhealthy fan or lost redundancy in red. It saves about 8 rows on a six-fan machine.
+- The layout fits 80 columns. It is taller than a 24-row terminal, so the screen scrolls:
+  `↑`/`↓` by a line, `PgUp`/`PgDn` by a page, `Home`/`End` to the top or bottom, or the
+  mouse wheel; `Tab` also scrolls whatever it focuses into view. These keys never touch
+  the slider, so scrolling cannot change the fan speed.
 
 ## Other tooling
 

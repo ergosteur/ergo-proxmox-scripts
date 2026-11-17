@@ -52,6 +52,7 @@ from pathlib import Path
 
 MIN_DUTY = 5  # percent; below this some fans stall
 MAX_DUTY = 100
+NARROW_BELOW = 100  # columns; below this the layout tightens so it fits an 80-column terminal
 REASSERT_EVERY = 15.0  # seconds; the BMC has been seen to drop manual mode silently
 SENSOR_FAILS_BEFORE_FALLBACK = 3
 
@@ -274,7 +275,12 @@ LABEL_W = 6  # width of the "100%  " prefix inside the slider
 
 
 class Slider(Widget, can_focus=True):
-    """A horizontal duty slider: arrows +/-1, PgUp/PgDn +/-5, Home/End, mouse."""
+    """A horizontal duty slider: left/right +/-1, shift+left/right +/-5, or the mouse.
+
+    Up/down, PgUp/PgDn and Home/End are deliberately not used here: they scroll the
+    screen, and with moving the slider switching to Manual, a stray End must not
+    mean "100%".
+    """
 
     DEFAULT_CSS = """
     Slider { height: 3; border: round $primary; padding: 0 1; }
@@ -283,10 +289,8 @@ class Slider(Widget, can_focus=True):
     BINDINGS = [
         Binding("left", "step(-1)", "-1", show=False),
         Binding("right", "step(1)", "+1", show=False),
-        Binding("pagedown", "step(-5)", "-5", show=False),
-        Binding("pageup", "step(5)", "+5", show=False),
-        Binding("home", "step(-100)", "min", show=False),
-        Binding("end", "step(100)", "max", show=False),
+        Binding("shift+left", "step(-5)", "-5", show=False),
+        Binding("shift+right", "step(5)", "+5", show=False),
     ]
 
     value: reactive[int] = reactive(MIN_DUTY)
@@ -366,6 +370,13 @@ def bar(frac: float, width: int = 24) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+class Panel(Static):
+    """The temperatures / fans box. Clicking it collapses both to one coloured line."""
+
+    def on_click(self) -> None:
+        self.app.action_toggle_compact()
+
+
 MODE_LABELS = {"daemon": "DAEMON CONTROL", "bmc": "BMC CONTROL", "manual": "MANUAL"}
 
 
@@ -375,24 +386,38 @@ class FanApp(App):
     #status { padding: 0 1; height: 3; content-align: left middle; }
     #panels { height: auto; }
     #temps, #fans { width: 1fr; height: auto; border: round $primary; padding: 0 1; }
+    #panels.compact { layout: vertical; }
+    #panels.compact #temps, #panels.compact #fans { width: 1fr; border: none; padding: 0 1; }
     #controls { height: auto; border: round $primary; padding: 0 1; }
     #modes, #presets { height: auto; }
-    #auto-group { width: auto; height: auto; border: round $primary; padding: 0 1; }
+    #auto-group, #daemon-group { width: auto; height: auto; border: round $primary; padding: 0 1; }
     #mode-manual { margin-top: 1; }
-    #service { height: auto; border: round $primary; padding: 0 1; }
-    #svc-row, #hold-row { height: auto; }
-    #svc-state, #hold-state { width: 1fr; height: 3; content-align: left middle; }
+    #modes-spacer { width: 1fr; height: 1; }
     Button { margin: 0 1 0 0; min-width: 12; }
+    Screen.-narrow Button { min-width: 6; }
+    Screen.-narrow #auto-group, Screen.-narrow #daemon-group { padding: 0; }
     Button.active { background: $success; color: $text; text-style: bold; }
     #log { height: 1fr; min-height: 5; border: round $primary; }
     """
+    # Adds "-narrow" or "-wide" to the screen, so the CSS below can adapt to the width.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (NARROW_BELOW, "-wide")]
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("d", "set_mode('daemon')", "Daemon"),
         Binding("b", "set_mode('bmc')", "BMC"),
         Binding("m", "set_mode('manual')", "Manual"),
-        Binding("plus,equals_sign", "bump(5)", "+5%"),
-        Binding("minus", "bump(-5)", "-5%"),
+        # One footer entry for both: the footer must fit an 80-column terminal.
+        Binding("plus,equals_sign", "bump(5)", "±5%", key_display="+/-"),
+        Binding("minus", "bump(-5)", "-5%", show=False),
+        Binding("c", "toggle_compact", "Compact"),
+        # The layout is taller than a 24-row terminal, so the screen scrolls. One
+        # footer entry stands for all of these.
+        Binding("down", "scroll_by(1)", "Scroll", key_display="↑↓"),
+        Binding("up", "scroll_by(-1)", "Scroll up", show=False),
+        Binding("pagedown", "scroll_page(1)", "Page down", show=False),
+        Binding("pageup", "scroll_page(-1)", "Page up", show=False),
+        Binding("home", "scroll_edge('home')", "Top", show=False),
+        Binding("end", "scroll_edge('end')", "Bottom", show=False),
     ]
 
     def __init__(self, cfg: Config | None = None, poll_interval: float = 2.0) -> None:
@@ -413,6 +438,7 @@ class FanApp(App):
         self._apply_timer = None
         self._quitting = False
         self._svc_busy = False
+        self.compact = False  # collapse the temperature and fan boxes to one coloured line each
         self.hold_pct = min(max(self.cfg.fan_speed, MIN_DUTY), MAX_DUTY)  # daemon's FAN_SPEED
         self.hold_pending = False  # a hold speed was saved and the service has not restarted since
         self._conf_mtime: float | None = None
@@ -425,35 +451,32 @@ class FanApp(App):
         yield Header(show_clock=True)
         yield Static(id="status")
         with Horizontal(id="panels"):
-            yield Static(id="temps")
-            yield Static(id="fans")
+            yield Panel(id="temps")
+            yield Panel(id="fans")
         with Vertical(id="controls"):
             with Horizontal(id="modes"):
                 with Horizontal(id="auto-group"):
                     yield Button("Daemon control", id="mode-daemon")
                     yield Button("BMC control", id="mode-bmc")
                 yield Button("Manual", id="mode-manual")
+                yield Static(id="modes-spacer")
+                with Horizontal(id="daemon-group"):
+                    yield Button("STOP", id="svc-toggle")
+                    yield Button("RESTART", id="svc-restart")
+                    yield Button("Set hold", id="hold-save")
             yield Slider(min(max(self.cfg.fan_speed, MIN_DUTY), MAX_DUTY), id="slider")
             with Horizontal(id="presets"):
                 yield Button("-5", id="bump-down")
                 yield Button("+5", id="bump-up")
                 for pct in (10, 20, 30, 50, 100):
                     yield Button(f"{pct}%", id=f"preset-{pct}")
-        with Vertical(id="service"):
-            with Horizontal(id="svc-row"):
-                yield Static(id="svc-state")
-                yield Button("STOP", id="svc-toggle")
-                yield Button("RESTART", id="svc-restart")
-            with Horizontal(id="hold-row"):
-                yield Static(id="hold-state")
-                yield Button("Set hold", id="hold-save")
         yield RichLog(id="log", wrap=True, markup=False, highlight=False)
         yield Footer()
 
     def on_mount(self) -> None:
         self.sub_title = f"{self.cfg.interface}  threshold {self.cfg.threshold}C"
         self.query_one("#auto-group").border_title = "AUTO"
-        self.query_one("#service").border_title = "Fan control daemon service"
+        self.query_one("#daemon-group").border_title = "FAN CONTROL DAEMON"
         self.note(f"config: {self.cfg.source}")
         self._refresh_all()
         self.query_one("#slider", Slider).focus()
@@ -772,9 +795,8 @@ class FanApp(App):
             hot, warm = 45, 35
         return "red" if v >= hot else "yellow" if v >= warm else "green"
 
-    def _refresh_all(self) -> None:
-        # Panels.
-        t = Text("Temperatures\n", style="bold")
+    def _temps_full(self, bar_w: int) -> Text:
+        t = Text("▾ Temperatures\n", style="bold")
         if not self.temps:
             t.append("  waiting for sensors...", style="grey50")
         for r in self.temps:
@@ -782,11 +804,12 @@ class FanApp(App):
                 t.append(f"  {r.label:<10} {r.text}\n", style="grey50")
                 continue
             t.append(f"  {r.label:<10} ")
-            t.append(bar(r.value / 100), style=self._temp_style(r))
+            t.append(bar(r.value / 100, bar_w), style=self._temp_style(r))
             t.append(f" {r.value:>3}°C\n")
-        self.query_one("#temps", Static).update(t)
+        return t
 
-        f = Text("Fans\n", style="bold")
+    def _fans_full(self, bar_w: int) -> Text:
+        f = Text("▾ Fans\n", style="bold")
         if not self.fans:
             f.append("  waiting for sensors...", style="grey50")
         for r in self.fans:
@@ -795,11 +818,66 @@ class FanApp(App):
                 f.append(f"  {r.label:<14} {r.text}\n", style=style)
                 continue
             f.append(f"  {r.label:<8} ")
-            f.append(bar(r.value / self.max_rpm_seen), style="cyan" if r.status == "ok" else "red")
+            f.append(bar(r.value / self.max_rpm_seen, bar_w), style="cyan" if r.status == "ok" else "red")
             f.append(f" {r.value:>5} RPM\n")
-        self.query_one("#fans", Static).update(f)
+        return f
 
-        # Status line.
+    def _temps_compact(self) -> Text:
+        """One line, colour-coded the same way as the bars: green, yellow, red."""
+        t = Text("▸ Temps  ", style="bold")
+        if not self.temps:
+            t.append("waiting for sensors...", style="grey50")
+        for r in self.temps:
+            if r.value is None:
+                t.append(f"{r.label} {r.text}  ", style="grey50")
+                continue
+            t.append(f"{r.label} ")
+            t.append(f"{r.value}°C", style=self._temp_style(r))
+            t.append("  ")
+        return t
+
+    def _fans_compact(self) -> Text:
+        """One line: the RPMs in order (cyan, or red and named if a fan is unhealthy),
+        then any status rows such as redundancy (green, or red)."""
+        f = Text("▸ Fans  ", style="bold")
+        if not self.fans:
+            f.append("waiting for sensors...", style="grey50")
+        rpms = [r for r in self.fans if r.value is not None]
+        for r in rpms:
+            if r.status == "ok":
+                f.append(f"{r.value} ", style="cyan")
+            else:
+                f.append(f"{r.label}:{r.value} ", style="bold red")
+        if rpms:
+            f.append("RPM", style="grey62")
+        for r in self.fans:
+            if r.value is None:
+                f.append(f"  {r.label.removeprefix('Fan ')}: {r.text}", style="green" if r.status == "ok" else "red")
+        return f
+
+    def action_toggle_compact(self) -> None:
+        self.compact = not self.compact
+        self.query_one("#panels").set_class(self.compact, "compact")
+        self._refresh_all()
+
+    def _refresh_all(self) -> None:
+        # Panels. Size the bars to what is left of each half-width panel after the
+        # label and the reading, so nothing wraps on an 80-column terminal.
+        narrow = self.size.width < NARROW_BELOW
+        gap = "\u00a0" * (2 if narrow else 4)
+        panel_w = self.query_one("#temps", Static).content_size.width or max(self.size.width // 2 - 4, 20)
+        tbar = max(6, min(24, panel_w - 20))
+        fbar = max(6, min(24, panel_w - 22))
+        if self.compact:
+            self.query_one("#temps", Static).update(self._temps_compact())
+            self.query_one("#fans", Static).update(self._fans_compact())
+        else:
+            self.query_one("#temps", Static).update(self._temps_full(tbar))
+            self.query_one("#fans", Static).update(self._fans_full(fbar))
+
+        # Status line: mode, service state, the daemon's hold speed, hottest CPU.
+        state = self.service_state
+        running = state in ("active", "activating", "reloading")
         s = Text()
         s.append("Mode: ")
         mode_style = {"daemon": "bold", "bmc": "bold cyan", "manual": "bold yellow"}[self.mode]
@@ -807,10 +885,23 @@ class FanApp(App):
         if self.mode == "manual":
             s.append(" ")
             s.append(f"at {self.slider.value}%", style="bold yellow")
-        s.append("\u00a0\u00a0\u00a0\u00a0Service: ")
-        svc_style = {"active": "green", "failed": "red"}.get(self.service_state, "yellow")
-        s.append(self.service_state, style=svc_style)
-        s.append("\u00a0\u00a0\u00a0\u00a0CPU max: ")
+        s.append(f"{gap}Service: ")
+        s.append(state, style={"active": "green", "failed": "red"}.get(state, "yellow"))
+        if running and self.mode in ("bmc", "manual"):
+            s.append("\u00a0(standing down)", style="grey62")
+        elif not running and self.mode == "daemon":
+            s.append("\u00a0(no controller: BMC curve in charge)", style="grey62")
+        s.append(f"{gap}Hold: ")
+        if self.cfg.path is None:
+            s.append("n/a", style="grey62")
+        else:
+            s.append(f"{self.hold_pct}%", style="bold")
+            if self.hold_unapplied:
+                s.append(
+                    "\u00a0(saved: restart to apply)" if running else "\u00a0(saved: applies on next start)",
+                    style="yellow",
+                )
+        s.append(f"{gap}CPU max: ")
         if self.max_cpu is None:
             s.append("?", style="red")
         else:
@@ -820,32 +911,11 @@ class FanApp(App):
 
         for name in ("daemon", "bmc", "manual"):
             self.query_one(f"#mode-{name}", Button).set_class(self.mode == name, "active")
+        # The AUTO box title carries the meaning, so the short labels lose nothing.
+        self.query_one("#mode-daemon", Button).label = "Daemon" if narrow else "Daemon control"
+        self.query_one("#mode-bmc", Button).label = "BMC" if narrow else "BMC control"
 
-        # Daemon service group.
-        state = self.service_state
-        running = state in ("active", "activating", "reloading")
-        v = Text()
-        v.append("● ", style="green" if state == "active" else "red" if state == "failed" else "yellow")
-        v.append(state)
-        if running and self.mode in ("bmc", "manual"):
-            v.append("\u00a0\u00a0(standing down while you are in control)", style="grey62")
-        elif not running and self.mode == "daemon":
-            v.append("\u00a0\u00a0(no controller: the BMC curve is in charge)", style="grey62")
-        self.query_one("#svc-state", Static).update(v)
-        h = Text()
-        if self.cfg.path is None:
-            h.append("Hold speed: n/a (no config file)", style="grey62")
-        else:
-            h.append(f"Hold speed: {self.hold_pct}%", style="bold")
-            h.append("\u00a0\u00a0(the daemon's fan duty while the CPUs are cool)", style="grey62")
-            if self.hold_unapplied:
-                h.append("\n")
-                h.append(
-                    "saved: restart the service to apply" if running
-                    else "saved: applies the next time the service starts",
-                    style="yellow",
-                )
-        self.query_one("#hold-state", Static).update(h)
+        # The daemon group: its state is in the top bar, so these are just buttons.
         save = self.query_one("#hold-save", Button)
         save.label = f"Set hold {self.slider.value}%"
         save.disabled = self.cfg.path is None or self.slider.value == self.hold_pct
@@ -856,6 +926,9 @@ class FanApp(App):
         self.query_one("#svc-restart", Button).disabled = state == "n/a"
 
     # -- events -----------------------------------------------------------
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._refresh_all()
 
     def on_slider_changed(self, event: Slider.Changed) -> None:
         self._refresh_all()
@@ -886,6 +959,21 @@ class FanApp(App):
 
     async def action_set_mode(self, mode: str) -> None:
         await self.set_mode(mode)
+
+    def action_scroll_by(self, lines: int) -> None:
+        self.screen.scroll_relative(y=lines, animate=False)
+
+    def action_scroll_page(self, direction: int) -> None:
+        if direction > 0:
+            self.screen.scroll_page_down(animate=False)
+        else:
+            self.screen.scroll_page_up(animate=False)
+
+    def action_scroll_edge(self, where: str) -> None:
+        if where == "home":
+            self.screen.scroll_home(animate=False)
+        else:
+            self.screen.scroll_end(animate=False)
 
     def action_bump(self, delta: int) -> None:
         self.slider.user_set(self.slider.value + delta)
